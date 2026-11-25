@@ -6,6 +6,25 @@ const loadPlugin = async () => {
   return globalThis.__openusage_plugin
 }
 
+it("shows local ZCode history and an active grant without requesting a remote quota", async () => {
+  const ctx = makeCtx()
+  ctx.nowIso = new Date(2026, 1, 2, 12).toISOString()
+  ctx.host.zcode = { scan: () => JSON.stringify({
+    daily: [{ date: "2026-02-02", totalTokens: 30, totalCost: null }],
+    entitlement: { quota: { level: "Start", limits: [
+      { planId: "wk-current", period: "one_time", unit: 500, usage: 80, remaining: 420,
+        nextResetTime: Date.parse(ctx.nowIso) + 60_000 },
+      { planId: "wk-expired", period: "one_time", unit: 600, usage: 90, remaining: 510,
+        nextResetTime: Date.parse(ctx.nowIso) - 60_000 },
+    ] } },
+  }) }
+  const { plan, lines } = (await loadPlugin()).probe(ctx)
+  expect(plan).toBe("Start Plan")
+  expect(lines.find(line => line.label === "Weekend Build")).toMatchObject({ used: 80, limit: 500 })
+  expect(lines.find(line => line.label === "Today")).toMatchObject({ value: "30 tokens" })
+  expect(ctx.host.http.request).not.toHaveBeenCalled()
+})
+
 const mockEnvWithKey = (ctx, key, varName = "ZAI_API_KEY") => {
   ctx.host.env.get.mockImplementation((name) => (name === varName ? key : null))
 }
@@ -677,4 +696,3 @@ describe("zai plugin", () => {
     expect(session.resetsAt).toBe(new Date(1738368000000).toISOString())
   })
 })
-

@@ -33,7 +33,7 @@ mod webkit_config;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
@@ -84,6 +84,7 @@ struct PendingProbe {
     plugin: plugin_engine::manifest::LoadedPlugin,
     account: provider_accounts::ProviderAccountContext,
     refresh_history: bool,
+    opencode_go_batch: Option<Arc<plugin_engine::host_api::OpenCodeGoProbeBatch>>,
 }
 
 #[derive(Default)]
@@ -103,6 +104,7 @@ impl ProbeCoord {
         plugin: plugin_engine::manifest::LoadedPlugin,
         account: provider_accounts::ProviderAccountContext,
         refresh_history: bool,
+        opencode_go_batch: Option<Arc<plugin_engine::host_api::OpenCodeGoProbeBatch>>,
     ) {
         let id = account.instance_id.clone();
         self.generation += 1;
@@ -112,6 +114,7 @@ impl ProbeCoord {
             work.plugin = plugin;
             work.account = account;
             work.refresh_history |= refresh_history;
+            work.opencode_go_batch = opencode_go_batch;
             return;
         }
         if !self.running.contains_key(&id) {
@@ -125,6 +128,7 @@ impl ProbeCoord {
                 plugin,
                 account,
                 refresh_history,
+                opencode_go_batch,
             },
         );
     }
@@ -793,6 +797,13 @@ async fn start_probe_batch(
         });
     }
 
+    let shared_opencode_go_batch = selected_plugins
+        .iter()
+        .filter(|(_, account)| account.base_provider_id == "opencode-go")
+        .nth(1)
+        .is_some()
+        .then(|| Arc::new(plugin_engine::host_api::OpenCodeGoProbeBatch::default()));
+
     let spawn_count = {
         let mut coord = probe_coord()
             .lock()
@@ -801,7 +812,18 @@ async fn start_probe_batch(
             .batch_remaining
             .insert(batch_id.clone(), selected_plugins.len());
         for (plugin, account) in selected_plugins {
-            coord.enqueue(batch_id.clone(), plugin, account, refresh_history.unwrap_or(false));
+            let opencode_go_batch = if account.base_provider_id == "opencode-go" {
+                shared_opencode_go_batch.clone()
+            } else {
+                None
+            };
+            coord.enqueue(
+                batch_id.clone(),
+                plugin,
+                account,
+                refresh_history.unwrap_or(false),
+                opencode_go_batch,
+            );
         }
         coord.reserve_workers()
     };
@@ -820,16 +842,26 @@ async fn start_probe_batch(
                     break;
                 };
                 let instance_id = work.account.instance_id.clone();
-                let batch_id = work.batch_ids.last().expect("probe work has a batch");
+                let batch_id = work.batch_ids.last().expect("probe work has a batch").clone();
+                let generation = work.generation;
+                let batch_ids = work.batch_ids.clone();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_and_emit_probe(
-                        &handle, &data_dir, &version, batch_id, work.generation, work.plugin, work.account, work.refresh_history,
+                        &handle,
+                        &data_dir,
+                        &version,
+                        &batch_id,
+                        generation,
+                        work.plugin,
+                        work.account,
+                        work.refresh_history,
+                        work.opencode_go_batch,
                     );
                 }));
                 if result.is_err() {
                     log::error!("publishing probe {} panicked", instance_id);
                 }
-                note_probe_finished(&handle, instance_id, work.batch_ids);
+                note_probe_finished(&handle, instance_id, batch_ids);
             }
         });
     }
@@ -849,6 +881,7 @@ fn run_and_emit_probe(
     plugin: plugin_engine::manifest::LoadedPlugin,
     account_context: provider_accounts::ProviderAccountContext,
     refresh_history: bool,
+    opencode_go_batch: Option<Arc<plugin_engine::host_api::OpenCodeGoProbeBatch>>,
 ) {
     let plugin_id = account_context.instance_id.clone();
     let probe_display_name = if account_context.label.trim().is_empty() {
@@ -861,12 +894,13 @@ fn run_and_emit_probe(
         )
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        plugin_engine::runtime::run_probe_with_deferred_usage_and_history(
+        plugin_engine::runtime::run_probe_with_deferred_usage_history_and_batch(
             &plugin,
             data_dir,
             version,
             account_context,
             refresh_history,
+            opencode_go_batch,
         )
     }));
     let (output, payloads) = result.unwrap_or_else(|_| {
