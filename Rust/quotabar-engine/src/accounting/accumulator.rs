@@ -11,7 +11,7 @@ use super::scan::LogUsageScan;
 use super::{adding_finite_cost, adding_saturating, cost_desc, localized_standard_compare};
 use crate::model::{
     DailyModelUsageEntry, DailyUsageEntry, DailyUsageSeries, ModelUsageEntry, ModelUsageSeries,
-    ModelUsageVariant,
+    ModelUsageVariant, ReportedUsageCost,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +47,9 @@ pub struct DailyUsageAccumulator {
     pub(super) overflowed_cost_days: BTreeSet<String>,
     pub(super) overflowed_api_estimate_days: BTreeSet<String>,
     pub(super) unmeasured_usage_days: BTreeSet<String>,
+    /// Provider-reported dollars per day with the tokens they cover (Swift `ReportedUsageCostAccumulator`).
+    pub(super) reported_costs: BTreeMap<String, ReportedUsageCost>,
+    pub(super) overflowed_reported_days: BTreeSet<String>,
 }
 
 impl DailyUsageAccumulator {
@@ -107,6 +110,27 @@ impl DailyUsageAccumulator {
             .entry(identity.to_string())
             .or_default()
             .add(tokens, cost, model, options.cost_is_complete, options.token_count_saturated);
+    }
+
+    /// Swift `ReportedUsageCostAccumulator.add`: sum the provider-reported dollars of a day with the
+    /// tokens they cover. A negative, non-finite or overflowing amount is dropped (an overflowing day
+    /// loses its reported cost for good).
+    pub fn add_reported_cost(&mut self, day: &str, dollars: Option<f64>, tokens: i64) {
+        let Some(dollars) = dollars.filter(|d| d.is_finite() && *d >= 0.0) else { return };
+        if tokens < 0 || self.overflowed_reported_days.contains(day) {
+            return;
+        }
+        let prior = self.reported_costs.get(day).cloned().unwrap_or(ReportedUsageCost { dollars: 0.0, covered_tokens: 0 });
+        let total = prior.dollars + dollars;
+        if !total.is_finite() {
+            self.reported_costs.remove(day);
+            self.overflowed_reported_days.insert(day.to_string());
+            return;
+        }
+        self.reported_costs.insert(
+            day.to_string(),
+            ReportedUsageCost { dollars: total, covered_tokens: adding_saturating(prior.covered_tokens, tokens) },
+        );
     }
 
     /// Keep a known component subtotal available internally while preventing it from being presented
@@ -216,7 +240,7 @@ impl DailyUsageAccumulator {
                         None
                     },
                     token_count_saturated: self.token_count_saturated_days.contains(day),
-                    reported_cost: None,
+                    reported_cost: self.reported_costs.get(day).cloned(),
                 }
             })
             .collect();

@@ -117,6 +117,9 @@ impl DailyUsageAccumulator {
             }
         }
         for day in scan.series.daily.iter().filter(|d| keep(&d.date)) {
+            if let Some(reported) = &day.reported_cost {
+                self.add_reported_cost(&day.date, Some(reported.dollars), reported.covered_tokens);
+            }
             replay_day_flags(self, day);
         }
         for day in incomplete_estimate_days(scan).into_iter().filter(|d| keep(d)) {

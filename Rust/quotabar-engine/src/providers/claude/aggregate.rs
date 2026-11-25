@@ -39,6 +39,8 @@ pub fn aggregate(entries: &[ClaudeEntry], since: f64, pricing: &ModelPricing) ->
         }
         accumulator.record_api_estimate(&day, estimate, tokens);
         accumulator.add(&day, tokens, cost, model_name);
+        // The log's own `costUSD` rides along as the day's provider-reported cost (Swift `reportedCost`).
+        accumulator.add_reported_cost(&day, entry.cost_usd, tokens);
     }
     accumulator.build()
 }
