@@ -45,24 +45,26 @@ body:
     attributes:
       label: QuotaBar Version
       description: Which version are you running?
-      placeholder: "e.g. 0.7.0"
-    validations:
-      required: true
-  - type: input
-    id: macos
-    attributes:
-      label: macOS Version
-      description: QuotaBar requires macOS 15 (Sequoia) or later.
-      placeholder: "e.g. 15.5"
+      placeholder: "e.g. 0.7.2-beta.2"
     validations:
       required: true
   - type: dropdown
-    id: chip
+    id: platform
     attributes:
-      label: Mac Type
+      label: Platform
       options:
-        - Apple Silicon
-        - Intel
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows 11 (x64)
+        - Other or unsure
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: Operating System Version
+      description: On Windows, run winver to see your version and build.
+      placeholder: "e.g. macOS 15.5 or Windows 11 24H2"
     validations:
       required: true
   - type: textarea

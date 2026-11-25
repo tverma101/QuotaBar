@@ -6,7 +6,7 @@ How QuotaBar turns token counts into estimated dollars across providers. OpenRou
 
 Prices are layered from four sources; when the same model appears in more than one, the earlier source wins:
 
-1. **QuotaBar pricing supplement** — a small JSON file published to GitHub Pages. Its aliases map provider log/CSV names; its curated prices and cache rates override public catalogues when maintainers have verified a better match or a model is missing.
+1. **Pricing supplement** — a bundled JSON file with aliases for provider log and CSV names, verified price overrides, and rates for gaps in public catalogues. QuotaBar also checks the public supplement hosted by OpenUsage upstream.
 2. **OpenRouter** — the live `/api/v1/models` catalogue supplies automatically discovered model IDs and published prompt/completion rates. Exact route IDs and unambiguous bare model IDs can match; OpenRouter entries are never fuzzy-matched.
 3. **LiteLLM** — the community-maintained `model_prices_and_context_window.json`, used as a fallback for models OpenRouter does not list.
 4. **models.dev** — a final exact-ID gap-filler for models the earlier sources miss.
@@ -25,7 +25,7 @@ fetches the public catalogue. The next usage refresh picks up a newly available 
 unchanged catalogue contents keep the same accounting cache identity. Ambiguous routes and models
 without published prompt/completion rates stay on their safe fallback estimate or remain unpriced.
 
-Because the supplement is published to GitHub Pages on merge, a pricing correction reaches installed apps within about an hour — no app update needed.
+Updates to the upstream supplement can reach installed apps at their next successful pricing check. QuotaBar ships its own bundled corrections with app builds.
 
 Updating the app also works. The supplement carries an ISO-8601 `updated_at` timestamp, and the app uses whichever of the cached and bundled copies is newer, so a build shipping fresher rates applies them straight away instead of waiting on the cache to expire. Timestamp precision matters because multiple pricing changes can land on the same day. Older date-only values remain supported. This matters most offline: without it, an old cache would shadow the shipped rates for as long as the feed stayed unreachable.
 
@@ -55,7 +55,7 @@ Codex GPT-6.1 Sol events preserve their reported service tier: Fast is estimated
 
 ## Privacy
 
-The pricing refresh fetches public model catalogues from OpenRouter, LiteLLM, models.dev, and this repo's GitHub Pages. It sends no usage or log data and does not send an OpenRouter API key. A live no-key GET currently succeeds, although OpenRouter's API reference documents bearer authorization; if the endpoint begins requiring a key, the last cached catalogue remains in use and the other sources still price models without an exact OpenRouter match.
+The pricing refresh fetches public model catalogues from OpenRouter, LiteLLM, models.dev, and the OpenUsage upstream pricing supplement. It sends no usage or log data and does not send an OpenRouter API key. If OpenRouter cannot be reached, QuotaBar uses its last cached catalogue and the other pricing sources.
 
 ## Maintainer notes
 
