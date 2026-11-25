@@ -2,6 +2,7 @@
 @import "tw-animate-css";
 @import "./motion.css";
 @import "./motion-fx.css";
+@import "./mac-settings.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -48,89 +49,143 @@
   --color-green-500: var(--green-500);
   --color-yellow-500: var(--yellow-500);
   --color-red-500: var(--red-500);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-track: var(--track);
+  --color-meter-normal: var(--meter-normal);
+  --color-meter-warning: var(--meter-warning);
+  --color-meter-critical: var(--meter-critical);
+  --color-segment: var(--segment);
+  --color-segment-selected: var(--segment-selected);
+  --color-chrome: var(--chrome);
+  --color-hairline: var(--hairline);
+  --color-control: var(--control);
+  --color-control-hover: var(--control-hover);
+  --color-switch-on: var(--switch-on);
+  --color-switch-off: var(--switch-off);
+  --color-grip: var(--grip);
+  --font-sans: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
 }
 
+/*
+ * Palette sampled from the macOS reference captures
+ * (docs/windows-port/reference/macos): panel, inset card, meter track, system
+ * blue/yellow/red meters, segmented control, nav bar/footer chrome and switches.
+ */
 :root {
   --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.13 0.028 261.692);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.13 0.028 261.692);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.13 0.028 261.692);
-  --primary: oklch(0.21 0.034 264.665);
-  --primary-foreground: oklch(0.985 0.002 247.839);
-  --secondary: oklch(0.967 0.003 264.542);
-  --secondary-foreground: oklch(0.21 0.034 264.665);
-  --muted: oklch(0.967 0.003 264.542);
-  --muted-foreground: oklch(0.551 0.027 264.364);
-  --accent: oklch(0.967 0.003 264.542);
-  --accent-foreground: oklch(0.21 0.034 264.665);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.928 0.006 264.531);
-  --input: oklch(0.928 0.006 264.531);
-  --ring: oklch(0.707 0.022 261.325);
+  --background: #ffffff;
+  --foreground: #1f1f1f;
+  --card: #ffffff;
+  --card-foreground: #1f1f1f;
+  --popover: #ffffff;
+  --popover-foreground: #1f1f1f;
+  --primary: #1f1f1f;
+  --primary-foreground: #ffffff;
+  --secondary: #f0f0f0;
+  --secondary-foreground: #1f1f1f;
+  --muted: #f0f0f0;
+  --muted-foreground: #7d7d7d;
+  --accent: #ececec;
+  --accent-foreground: #1f1f1f;
+  --destructive: #ff3b30;
+  --border: rgba(0, 0, 0, 0.09);
+  --input: rgba(0, 0, 0, 0.12);
+  --ring: rgba(0, 118, 246, 0.55);
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.985 0.002 247.839);
-  --sidebar-foreground: oklch(0.13 0.028 261.692);
-  --sidebar-primary: oklch(0.21 0.034 264.665);
-  --sidebar-primary-foreground: oklch(0.985 0.002 247.839);
-  --sidebar-accent: oklch(0.967 0.003 264.542);
-  --sidebar-accent-foreground: oklch(0.21 0.034 264.665);
-  --sidebar-border: oklch(0.928 0.006 264.531);
-  --sidebar-ring: oklch(0.707 0.022 261.325);
+  --sidebar: #f7f7f7;
+  --sidebar-foreground: #1f1f1f;
+  --sidebar-primary: #1f1f1f;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ececec;
+  --sidebar-accent-foreground: #1f1f1f;
+  --sidebar-border: rgba(0, 0, 0, 0.09);
+  --sidebar-ring: rgba(0, 118, 246, 0.55);
 
-  /* Tailwind green/yellow/red-500 (light: stock defaults) */
-  --green-500: oklch(0.723 0.219 142.37);
-  --yellow-500: oklch(0.795 0.184 86.047);
-  --red-500: oklch(0.637 0.237 25.331);
+  --page-accent: #0076f6;
+  --green-500: #34c759;
+  --yellow-500: #ffcc00;
+  --red-500: #ff3b30;
+
+  /* macOS panel surfaces */
+  --surface: #f7f7f7;
+  --surface-hover: #efefef;
+  --track: #e0e0e0;
+  --meter-normal: #0088ff;
+  --meter-warning: #ffcc00;
+  --meter-critical: #ff3b30;
+  --segment: #ececec;
+  --segment-selected: #ffffff;
+  --chrome: #fdfdfd;
+  --hairline: rgba(0, 0, 0, 0.1);
+  --control: #ececec;
+  --control-hover: #e2e2e2;
+  --switch-on: #0076f6;
+  --switch-off: #d8d8d8;
+  --switch-knob: #ffffff;
+  --switch-knob-on: #ffffff;
+  --grip: #b8b8b8;
 }
 
 :root.dark {
-  --background: #1c1c1e;
-  --foreground: #ededed;
-  --card: #1c1c1e;
-  --card-foreground: #ededed;
-  --popover: #2c2c2e;
-  --popover-foreground: #ededed;
-  --primary: #ededed;
-  --primary-foreground: #0a0a0a;
-  --secondary: #252527;
-  --secondary-foreground: #ededed;
-  --muted: #2a2a2c;
-  --muted-foreground: #888888;
-  --accent: #252527;
-  --accent-foreground: #ededed;
-  --destructive: #ef4444;
+  --background: #1e1e1e;
+  --foreground: #ececec;
+  --card: #1e1e1e;
+  --card-foreground: #ececec;
+  --popover: #2a2a2a;
+  --popover-foreground: #ececec;
+  --primary: #ececec;
+  --primary-foreground: #1e1e1e;
+  --secondary: #2c2c2c;
+  --secondary-foreground: #ececec;
+  --muted: #2a2a2a;
+  --muted-foreground: #9c9c9c;
+  --accent: #2e2e2e;
+  --accent-foreground: #ececec;
+  --destructive: #ff453a;
   --border: rgba(255, 255, 255, 0.08);
-  --input: rgba(255, 255, 255, 0.08);
-  --ring: #555555;
+  --input: rgba(255, 255, 255, 0.1);
+  --ring: rgba(10, 132, 255, 0.6);
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: #2a2a2c;
-  --sidebar-foreground: #ededed;
-  --sidebar-primary: #ededed;
-  --sidebar-primary-foreground: #0a0a0a;
-  --sidebar-accent: #2a2a2c;
-  --sidebar-accent-foreground: #ededed;
+  --sidebar: #242424;
+  --sidebar-foreground: #ececec;
+  --sidebar-primary: #ececec;
+  --sidebar-primary-foreground: #1e1e1e;
+  --sidebar-accent: #2e2e2e;
+  --sidebar-accent-foreground: #ececec;
   --sidebar-border: rgba(255, 255, 255, 0.08);
-  --sidebar-ring: #555555;
+  --sidebar-ring: rgba(10, 132, 255, 0.6);
 
-  /* Accent highlight (lime) */
-  --page-accent: #BFFF00;
+  --page-accent: #0a84ff;
+  --green-500: #30d158;
+  --yellow-500: #ffd60a;
+  --red-500: #ff453a;
 
-  /* Tailwind green/yellow/red-500 derived from page-accent lime
-     #BFFF00 ≈ oklch(0.93 0.27 128) — hue-rotate, keep chroma family */
-  --green-500: oklch(0.93 0.27 128);
-  --yellow-500: oklch(0.90 0.21 85);
-  --red-500: oklch(0.70 0.24 29);
+  --surface: #242424;
+  --surface-hover: #2b2b2b;
+  --track: #393939;
+  --meter-normal: #0091ff;
+  --meter-warning: #ffd600;
+  --meter-critical: #ff453a;
+  --segment: #2e2e2e;
+  --segment-selected: #1f2326;
+  --chrome: #1c1c1c;
+  --hairline: #383838;
+  --control: #2a2a2a;
+  --control-hover: #333333;
+  --switch-on: #0a7cff;
+  --switch-off: #373737;
+  --switch-knob: #e1e1e1;
+  --switch-knob-on: #daecff;
+  --grip: #5a5a5a;
 }
 
 @layer base {

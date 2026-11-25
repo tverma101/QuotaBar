@@ -1,5 +1,5 @@
 import { create } from "zustand"
-import { metricId, parseMetricId } from "@/lib/metric-id"
+import { metricId, metricIdPrefix, parseMetricId } from "@/lib/metric-id"
 import {
   DEFAULT_PINNED_METRIC_IDS,
   EMPTY_MODERN_LAYOUT,
@@ -29,6 +29,10 @@ type ModernLayoutStore = ModernLayoutState & {
   setProviderMetricsEnabled: (pluginId: string, metricIds: string[], enabled: boolean) => void
   togglePin: (metricIdValue: string) => boolean
   setTrayFocusProvider: (pluginId: string | null) => void
+  setMetricOnDemand: (metricIdValue: string, onDemand: boolean) => void
+  /** Customize detail drag: new row order plus each row's Always Visible / On Demand section. */
+  setProviderArrangement: (pluginId: string, order: string[], onDemandById: Record<string, boolean>) => void
+  resetProviderLayout: (pluginId: string) => void
   applyTrayReadout: (pluginId: string, lineLabel: string) => void
   setPinnedOrder: (order: string[]) => void
   syncDescriptors: (descriptors: MetricDescriptor[]) => void
@@ -82,6 +86,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
       metricOrderByProvider: defaultMetricOrderByProvider(descriptors),
       pinnedMetricIds: pinned,
       trayFocusProviderId: pinned.length > 0 ? (parseMetricId(pinned[0])?.pluginId ?? null) : null,
+      onDemandOverrides: current.onDemandOverrides,
       initialized: true,
     }
     set({ ...next, hydrated: true })
@@ -125,6 +130,32 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
 
   setTrayFocusProvider: (pluginId) => {
     set({ trayFocusProviderId: pluginId })
+    void get().persist()
+  },
+
+  setMetricOnDemand: (metricIdValue, onDemand) => {
+    set((s) => ({ onDemandOverrides: { ...s.onDemandOverrides, [metricIdValue]: onDemand } }))
+    void get().persist()
+  },
+
+  setProviderArrangement: (pluginId, order, onDemandById) => {
+    set((s) => ({
+      metricOrderByProvider: { ...s.metricOrderByProvider, [pluginId]: order },
+      onDemandOverrides: { ...s.onDemandOverrides, ...onDemandById },
+    }))
+    void get().persist()
+  },
+
+  resetProviderLayout: (pluginId) => {
+    const prefix = metricIdPrefix(pluginId)
+    set((s) => {
+      const onDemandOverrides = Object.fromEntries(
+        Object.entries(s.onDemandOverrides).filter(([id]) => !id.startsWith(prefix)),
+      )
+      const metricOrderByProvider = { ...s.metricOrderByProvider }
+      delete metricOrderByProvider[pluginId]
+      return { onDemandOverrides, metricOrderByProvider }
+    })
     void get().persist()
   },
 
@@ -237,6 +268,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
       metricOrderByProvider,
       pinnedMetricIds,
       trayFocusProviderId,
+      onDemandOverrides,
       initialized,
     } = get()
     await saveModernLayout({
@@ -245,6 +277,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
       metricOrderByProvider,
       pinnedMetricIds,
       trayFocusProviderId,
+      onDemandOverrides,
       initialized,
     })
   },

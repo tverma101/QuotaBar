@@ -8,6 +8,9 @@ type UsageSparklineProps = {
   points: BarChartPoint[]
   note?: string
   color?: string
+  /** "mac": Modern dashboard row — semibold label, blue bars on the right like the macOS panel. */
+  variant?: "default" | "mac"
+  compact?: boolean
 }
 
 const pointLabel = (point: BarChartPoint) => point.valueLabel ?? formatCountNumber(point.value)
@@ -15,7 +18,8 @@ const pointLabel = (point: BarChartPoint) => point.valueLabel ?? formatCountNumb
 // Inline, glanceable usage history that matches the card's row rhythm.
 // Hover/focus reveals a larger, readable graph (detail-on-demand); hovering a
 // day's bar in that graph shows exactly how much was used that day.
-export function UsageSparkline({ label, points, note, color }: UsageSparklineProps) {
+export function UsageSparkline({ label, points, note, color, variant = "default", compact }: UsageSparklineProps) {
+  const mac = variant === "mac"
   const valid = points.filter((point) => Number.isFinite(point.value) && point.value >= 0)
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
   if (valid.length === 0) return null
@@ -45,18 +49,31 @@ export function UsageSparkline({ label, points, note, color }: UsageSparklinePro
             {...props}
             type="button"
             aria-label={summary}
-            className="flex h-[18px] w-full items-center justify-between gap-2 rounded-sm border-0 bg-transparent p-0 text-left outline-none [touch-action:manipulation] focus-visible:ring-2 focus-visible:ring-ring"
+            className={cn(
+              "flex w-full items-center justify-between gap-2 rounded-sm border-0 bg-transparent p-0 text-left outline-none [touch-action:manipulation] focus-visible:ring-2 focus-visible:ring-ring",
+              mac ? (compact ? "h-[16px]" : "h-[20px]") : "h-[18px]",
+            )}
           >
-            <span className="min-w-0 truncate text-xs text-muted-foreground">{label}</span>
+            <span
+              className={cn(
+                "min-w-0 truncate",
+                mac ? cn("font-semibold text-foreground", compact ? "text-[12px]" : "text-[13px]") : "text-xs text-muted-foreground",
+              )}
+            >
+              {label}
+            </span>
             <span
               aria-hidden
-              className="flex h-4 w-1/2 max-w-[150px] flex-shrink-0 items-end justify-end gap-px"
+              className={cn(
+                "flex flex-shrink-0 items-end justify-end",
+                mac ? cn("w-[120px] gap-[2px]", compact ? "h-[14px]" : "h-[18px]") : "h-4 w-1/2 max-w-[150px] gap-px",
+              )}
             >
               {valid.map((point, index) => (
                 <span
                   key={`${point.label}-${index}`}
-                  className="min-w-[2px] flex-1 rounded-[1px] bg-primary"
-                  style={barStyle(point, 10)}
+                  className={cn("min-w-[2px] flex-1", mac ? "rounded-[1.5px] bg-meter-normal" : "rounded-[1px] bg-primary")}
+                  style={barStyle(point, mac ? 12 : 10)}
                 />
               ))}
             </span>
@@ -84,7 +101,8 @@ export function UsageSparkline({ label, points, note, color }: UsageSparklinePro
             >
               <span
                 className={cn(
-                  "w-full rounded-[1px] bg-primary transition-opacity",
+                  "w-full rounded-[1px] transition-opacity",
+                  mac ? "bg-meter-normal" : "bg-primary",
                   activeIndex != null && index !== activeIndex && "opacity-40"
                 )}
                 style={barStyle(point, 6)}

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react"
 import { useShallow } from "zustand/react/shallow"
-import { Button } from "@/components/ui/button"
+import { Check, ChevronDown, Info } from "lucide-react"
 import {
   Tooltip,
   TooltipContent,
@@ -32,6 +32,16 @@ import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 
 const RING_SIZE = 104
 const MIN_SLICE_SHARE = 0.025
+
+/** Near-black / near-white brand colors (Cursor) follow the label color, like macOS. */
+function adaptiveSliceColor(providerId: string, brandColor?: string): string {
+  const color = totalSpendColor(providerId, brandColor)
+  const hex = /^#([0-9a-f]{6})$/i.exec(color.trim())?.[1]
+  if (!hex) return color
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+  const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+  return luminance < 0.12 || luminance > 0.92 ? "var(--foreground)" : color
+}
 
 type TotalSpendCardProps = {
   providers: TotalSpendProvider[]
@@ -81,34 +91,32 @@ export function TotalSpendCard({ providers, outputs, compact, className }: Total
   const info = `Only includes ${capable.map((p) => p.displayName).join(", ")}.`
 
   return (
-    <section className={cn("space-y-1.5 motion-card", className)}>
-      <header className="flex items-center gap-1.5 px-1">
+    <section className={cn("motion-card", compact ? "space-y-[2px]" : "space-y-[4px]", className)}>
+      <header className="flex items-center gap-1.5 px-[8px]">
         <div className="relative">
-          <Button
+          <button
             type="button"
-            variant="ghost"
-            size="sm"
-            className={cn("h-auto px-1 py-0.5 font-semibold", compact ? "text-sm" : "text-base")}
+            className={cn(
+              "flex items-center gap-1 rounded-[6px] font-semibold tracking-[-0.01em] outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              compact ? "text-[15px]" : "text-[17px]",
+            )}
             aria-label="Total Spend Metric"
             aria-expanded={metricMenuOpen}
             onClick={() => setMetricMenuOpen((o) => !o)}
           >
             {TOTAL_SPEND_METRIC_TITLE[metric]}
-            <span className="ml-1 text-muted-foreground text-[10px]">▾</span>
-          </Button>
+            <ChevronDown className="size-3.5 text-muted-foreground" strokeWidth={2.5} aria-hidden />
+          </button>
           {metricMenuOpen ? (
-            <div className="absolute left-0 top-full z-20 mt-1 min-w-[9rem] rounded-md border bg-popover p-1 shadow-md">
+            <div className="absolute left-0 top-full z-20 mt-1 min-w-[10rem] rounded-[10px] border border-hairline bg-popover p-[5px] shadow-[0_10px_30px_rgba(0,0,0,0.3)]">
               {TOTAL_SPEND_METRICS.map((option) => (
                 <button
                   key={option}
                   type="button"
-                  className={cn(
-                    "flex w-full items-center rounded-sm px-2 py-1.5 text-left text-sm hover:bg-muted",
-                    option === metric && "font-semibold",
-                  )}
+                  className="flex h-[28px] w-full items-center gap-2 rounded-[6px] px-2 text-left text-[13px] transition-colors hover:bg-switch-on hover:text-white"
                   onClick={() => setMetric(option)}
                 >
-                  {option === metric ? "✓ " : ""}
+                  <Check className={cn("size-3.5", option !== metric && "invisible")} aria-hidden />
                   {TOTAL_SPEND_METRIC_TITLE[option]}
                 </button>
               ))}
@@ -120,10 +128,10 @@ export function TotalSpendCard({ providers, outputs, compact, className }: Total
             render={(props) => (
               <span
                 {...props}
-                className="text-muted-foreground text-xs cursor-default"
+                className="flex cursor-default text-muted-foreground"
                 aria-label="Total Spend info"
               >
-                ⓘ
+                <Info className="size-4" strokeWidth={1.75} />
               </span>
             )}
           />
@@ -133,19 +141,21 @@ export function TotalSpendCard({ providers, outputs, compact, className }: Total
         </Tooltip>
       </header>
 
-      <div className="rounded-lg border bg-card/80 px-3.5 py-3">
-        <div className="mb-3 flex rounded-full bg-muted/60 p-0.5">
+      <div className={cn("rounded-[12px] bg-surface px-[14px]", compact ? "py-[10px]" : "py-[12px]")}>
+        <div className={cn("flex rounded-full bg-segment p-[3px]", compact ? "mb-2" : "mb-3")}>
           {TOTAL_SPEND_PERIODS.map((candidate) => {
             const selected = candidate === period
             return (
               <button
                 key={candidate}
                 type="button"
+                aria-pressed={selected}
                 className={cn(
-                  "flex-1 rounded-full px-2 py-1 text-[11px] transition-colors",
+                  "flex-1 rounded-full px-2 text-[13px] transition-colors",
+                  compact ? "py-[3px]" : "py-[5px]",
                   selected
-                    ? "bg-background font-semibold text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
+                    ? "bg-segment-selected font-semibold text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.18)]"
+                    : "font-medium text-muted-foreground hover:text-foreground",
                 )}
                 onClick={() => setPeriod(candidate)}
               >
@@ -156,7 +166,7 @@ export function TotalSpendCard({ providers, outputs, compact, className }: Total
         </div>
 
         {projection.slices.length === 0 ? (
-          <p className="py-6 text-center text-sm text-muted-foreground">
+          <p className="py-6 text-center text-[13px] text-muted-foreground">
             {TOTAL_SPEND_METRIC_EMPTY[metric]}
           </p>
         ) : (
@@ -191,7 +201,7 @@ function TotalSpendRing({
     cursor = end
     return {
       id: slice.provider.id,
-      color: totalSpendColor(slice.provider.id, slice.provider.brandColor),
+      color: adaptiveSliceColor(slice.provider.id, slice.provider.brandColor),
       start,
       end,
       slice,
@@ -215,15 +225,15 @@ function TotalSpendRing({
                   <path
                     key={arc.id}
                     d={donutSectorPath(RING_SIZE / 2, RING_SIZE / 2, RING_SIZE / 2 - 2, RING_SIZE * 0.28, arc.start, arc.end)}
-                    fill={arc.color}
+                    style={{ fill: arc.color }}
                   />
                 ))}
               </svg>
               <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center px-2 text-center">
-                <span className="text-[13px] font-semibold tabular-nums leading-tight">
+                <span className="text-[15px] font-bold tabular-nums leading-tight">
                   {centerLabel.primary}
                 </span>
-                <span className="text-[9px] text-muted-foreground">{centerLabel.unit}</span>
+                <span className="text-[10px] font-medium text-muted-foreground">{centerLabel.unit}</span>
               </div>
             </div>
           )}
@@ -233,15 +243,15 @@ function TotalSpendRing({
         </TooltipContent>
       </Tooltip>
 
-      <ul className="min-w-0 flex-1 space-y-1.5">
+      <ul className="min-w-0 flex-1 space-y-[6px]">
         {projectionSlices.map((slice) => (
-          <li key={slice.provider.id} className="flex items-center gap-2 text-sm">
+          <li key={slice.provider.id} className="flex items-center gap-2 text-[13px]">
             <span
               className="h-2 w-2 shrink-0 rounded-full"
-              style={{ backgroundColor: totalSpendColor(slice.provider.id, slice.provider.brandColor) }}
+              style={{ backgroundColor: adaptiveSliceColor(slice.provider.id, slice.provider.brandColor) }}
             />
             <span className="min-w-0 flex-1 truncate">{slice.provider.displayName}</span>
-            <span className="shrink-0 tabular-nums text-muted-foreground">
+            <span className="shrink-0 font-medium tabular-nums text-foreground/85">
               {formatTotalSpendLegend(slice.displayAmount, metric)}
             </span>
           </li>

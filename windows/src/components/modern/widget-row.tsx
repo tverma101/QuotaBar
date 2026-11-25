@@ -1,31 +1,39 @@
 import type { ReactNode } from "react"
+import { Flame } from "lucide-react"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { RateLimitResetsValue } from "@/components/rate-limit-resets-popover"
 import { UsageSparkline } from "@/components/usage-sparkline"
 import type { WidgetData } from "@/lib/widget-data"
-import { meterFraction } from "@/lib/widget-data"
-import type { PaceStatus } from "@/lib/pace-status"
-import { getPaceStatusText } from "@/lib/pace-tooltip"
+import type { DisplayMode } from "@/lib/settings"
+import { displayMetricLabel } from "@/lib/metric-display"
+import {
+  meterFillFraction,
+  meterSeverity,
+  meterState,
+  meterWarningText,
+  paceTickFraction,
+  type MeterSeverity,
+} from "@/lib/meter-state"
 import { formatMoney } from "@/lib/locale-format"
 import { cn } from "@/lib/utils"
 import { MotionNumber } from "@/components/motion-number"
 
-const PACE_DOT: Record<PaceStatus, string> = {
-  ahead: "bg-green-500",
-  "on-track": "bg-yellow-500",
-  behind: "bg-red-500",
-}
-
-const PACE_FILL: Record<PaceStatus, string> = {
-  ahead: "bg-green-500",
-  "on-track": "bg-yellow-500",
-  behind: "bg-red-500",
-}
-
 const EXPIRY_DOT: Record<string, string> = {
-  normal: "bg-blue-500",
-  warning: "bg-yellow-500",
-  critical: "bg-red-500",
+  normal: "bg-meter-normal",
+  warning: "bg-meter-warning",
+  critical: "bg-meter-critical",
+}
+
+const SEVERITY_FILL: Record<MeterSeverity, string> = {
+  normal: "bg-meter-normal",
+  warning: "bg-meter-warning",
+  critical: "bg-meter-critical",
+}
+
+const SEVERITY_TEXT: Record<MeterSeverity, string> = {
+  normal: "text-meter-normal",
+  warning: "text-meter-warning",
+  critical: "text-meter-critical",
 }
 
 const SPEND_LABELS = new Set(["today", "yesterday", "last 30 days"])
@@ -35,32 +43,11 @@ type WidgetRowProps = {
   compact?: boolean
   className?: string
   onRefreshPlugin?: (pluginId: string) => void
-}
-
-function PaceDot({ data }: { data: WidgetData }) {
-  if (!data.bounded || !data.paceStatus) return null
-  const status = data.paceStatus
-  const dotColor = data.color
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={(props) => (
-          <span
-            {...props}
-            className={cn("inline-block w-1.5 h-1.5 rounded-full shrink-0 motion-dot", !dotColor && PACE_DOT[status])}
-            style={dotColor ? { backgroundColor: dotColor } : undefined}
-            aria-label={data.isLimitReached ? "Limit reached" : getPaceStatusText(status)}
-          />
-        )}
-      />
-      <TooltipContent side="top" className="text-xs text-center max-w-[200px]">
-        {data.isLimitReached ? "Limit reached" : getPaceStatusText(status)}
-        {data.paceDetail ? (
-          <div className="text-[10px] opacity-70 mt-0.5">{data.paceDetail}</div>
-        ) : null}
-      </TooltipContent>
-    </Tooltip>
-  )
+  /** Used/Left framing of the meter fill (Settings → Show Usage As). */
+  displayMode?: DisplayMode
+  nowMs?: number
+  /** A text row directly under another text row pulls up so spend rows read as one cluster. */
+  condensedTop?: boolean
 }
 
 function TextValue({ data, compact, onRefreshPlugin }: WidgetRowProps) {
@@ -72,7 +59,7 @@ function TextValue({ data, compact, onRefreshPlugin }: WidgetRowProps) {
   let valueNode: ReactNode = (
     <span
       className={cn(
-        "font-medium tabular-nums shrink-0",
+        "tabular-nums truncate text-foreground",
         data.loading && "text-muted-foreground animate-pulse",
       )}
     >
@@ -102,7 +89,7 @@ function TextValue({ data, compact, onRefreshPlugin }: WidgetRowProps) {
             <span
               {...props}
               className={cn(
-                "font-medium tabular-nums shrink-0 underline decoration-dotted underline-offset-2 cursor-default",
+                "tabular-nums truncate cursor-default rounded-[6px] px-[7px] py-[4px] -mx-[7px] -my-[4px] transition-colors hover:bg-control",
                 props.className,
               )}
             >
@@ -172,64 +159,123 @@ function TextValue({ data, compact, onRefreshPlugin }: WidgetRowProps) {
   )
 }
 
-export function WidgetRow({ data, compact, className, onRefreshPlugin }: WidgetRowProps) {
+function Meter({
+  fraction,
+  severity,
+  tick,
+  compact,
+}: {
+  fraction: number
+  severity: MeterSeverity | null
+  tick: number | null
+  compact?: boolean
+}) {
+  return (
+    <div
+      className={cn("relative w-full overflow-hidden rounded-full bg-track", compact ? "h-[4px]" : "h-[5px]")}
+      data-severity={severity ?? "none"}
+    >
+      {severity ? (
+        <div
+          className={cn("h-full rounded-full transition-[width] duration-300 ease-out", SEVERITY_FILL[severity])}
+          style={{ width: `${Math.round(fraction * 1000) / 10}%` }}
+        />
+      ) : null}
+      {tick != null ? (
+        <span
+          aria-hidden
+          className="absolute inset-y-0 w-[2px] -translate-x-1/2 bg-surface"
+          style={{ left: `${Math.round(tick * 1000) / 10}%` }}
+        />
+      ) : null}
+    </div>
+  )
+}
+
+export function WidgetRow({
+  data,
+  compact,
+  className,
+  onRefreshPlugin,
+  displayMode = "left",
+  nowMs = Date.now(),
+  condensedTop,
+}: WidgetRowProps) {
+  const label = displayMetricLabel(data.label)
+  const labelClass = cn("min-w-0 truncate font-semibold", compact ? "text-[12px]" : "text-[13px]")
+  const supportClass = compact ? "text-[11px]" : "text-[12px]"
+
   if (data.kind === "barChart" && data.barChartPoints?.length) {
     return (
-      <div className={cn(compact ? "py-1" : "py-1.5", className)}>
+      <div className={cn("px-[14px]", compact ? "py-[4px]" : "py-[6px]", className)}>
         <UsageSparkline
-          label={data.label}
+          label={label}
           points={data.barChartPoints}
           note={data.barChartNote}
+          variant="mac"
+          compact={compact}
         />
       </div>
     )
   }
 
-  if (!data.bounded) {
+  if (data.bounded) {
+    const state = meterState(data, nowMs)
+    const severity = meterSeverity(state)
+    const warning = meterWarningText(state)
+    const tick = paceTickFraction(data, state, displayMode, nowMs)
+    const hasReading = state.kind !== "noData"
+    const trailing = hasReading
+      ? (data.textSecondary ?? (data.format && data.format !== "percent" && data.limitText ? `${data.limitText} limit` : null))
+      : "No data"
+    const flame = state.kind === "spent" || state.kind === "runningOut"
     return (
-      <div
-        className={cn(
-          "flex items-baseline justify-between gap-2",
-          compact ? "py-0.5 text-xs" : "py-1 text-sm",
-          className,
-        )}
-      >
-        <span className="text-muted-foreground truncate">{data.label}</span>
-        <TextValue data={data} compact={compact} onRefreshPlugin={onRefreshPlugin} />
+      <div className={cn("px-[14px]", compact ? "py-[5px]" : "py-[10px]", className)} data-metric-row="bounded">
+        <div className={cn("flex flex-col", compact ? "gap-[3px]" : "gap-[4px]")}>
+          <div className="flex items-center gap-2">
+            <span className={cn(labelClass, "flex-1")}>{label}</span>
+            {warning || flame ? (
+              <span className={cn("flex shrink-0 items-center gap-1 text-muted-foreground", supportClass)}>
+                {flame && severity ? <Flame className={cn("size-3 fill-current", SEVERITY_TEXT[severity])} aria-hidden /> : null}
+                {warning}
+              </span>
+            ) : null}
+          </div>
+          <Meter fraction={meterFillFraction(data, displayMode)} severity={severity} tick={tick} compact={compact} />
+          <div className={cn("flex items-baseline justify-between gap-3 tabular-nums", supportClass)}>
+            <span className="shrink-0 text-foreground">
+              {hasReading && data.textValue ? <MotionNumber value={data.textValue} className="motion-number" /> : "—"}
+            </span>
+            {trailing ? <span className="min-w-0 truncate text-muted-foreground">{trailing}</span> : null}
+          </div>
+        </div>
       </div>
     )
   }
 
-  const fraction = meterFraction(data)
-  const fillClass =
-    data.paceStatus && !data.isLimitReached
-      ? PACE_FILL[data.paceStatus]
-      : "bg-primary"
-  const fillColor = data.color
-
+  const noData = data.loading || data.kind === "barChart"
   return (
-    <div className={cn(compact ? "py-1" : "py-1.5", className)}>
-      <div className={cn("flex items-center gap-1.5 mb-1", compact ? "text-xs" : "text-sm")}>
-        <PaceDot data={data} />
-        <span className="font-medium truncate flex-1">{data.label}</span>
-        <span className="tabular-nums shrink-0">
-          {data.textValue ? <MotionNumber value={data.textValue} className="motion-number" /> : null}
-        </span>
+    <div
+      className={cn(
+        "flex items-center justify-between gap-3 px-[14px]",
+        condensedTop
+          ? compact ? "pt-[1px] pb-[4px]" : "pt-[2px] pb-[6px]"
+          : compact ? "py-[4px]" : "py-[6px]",
+        className,
+      )}
+      data-metric-row="text"
+    >
+      <span className={labelClass}>{label}</span>
+      <div className={cn("flex min-w-0 flex-col items-end gap-0.5", supportClass)}>
+        {noData ? (
+          <span className="font-semibold">No data</span>
+        ) : (
+          <TextValue data={data} compact={compact} onRefreshPlugin={onRefreshPlugin} />
+        )}
+        {!noData && data.textSecondary ? (
+          <span className="truncate text-[11px] text-muted-foreground">{data.textSecondary}</span>
+        ) : null}
       </div>
-      <div className={cn("relative rounded-full bg-muted overflow-hidden", compact ? "h-1" : "h-1.5")}>
-        <div
-          className={cn("h-full rounded-full", !fillColor && fillClass)}
-          style={{
-            width: `${Math.round(fraction * 100)}%`,
-            ...(fillColor ? { backgroundColor: fillColor } : {}),
-          }}
-        />
-      </div>
-      {data.textSecondary ? (
-        <p className={cn("text-muted-foreground mt-0.5", compact ? "text-[10px]" : "text-xs")}>
-          {data.textSecondary}
-        </p>
-      ) : null}
     </div>
   )
 }
