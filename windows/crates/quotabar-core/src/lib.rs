@@ -5,6 +5,7 @@ pub mod plugin_engine;
 pub mod chromium_cookies;
 mod provider_accounts_crypto;
 pub mod provider_accounts;
+pub mod codex_accounts;
 pub mod proxy_config;
 pub mod usage_metrics;
 pub mod limits_export;

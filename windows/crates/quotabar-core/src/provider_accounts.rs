@@ -1,3 +1,4 @@
+use crate::codex_accounts::CodexHome;
 use crate::provider_accounts_crypto::{
     self, EncryptedProviderAccountsFile, STORE_FORMAT_V1,
 };
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 const STORE_FILE: &str = "provider_accounts.json";
+static STORE_MUTATION: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct HistoryIdentity {
@@ -134,6 +136,8 @@ pub struct ProviderAccount {
     pub label: String,
     #[serde(default)]
     pub credential: ProviderCredential,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<CodexHome>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -149,6 +153,7 @@ pub struct ProviderAccountContext {
     pub base_provider_id: String,
     pub label: String,
     pub credential: Option<ProviderCredential>,
+    pub codex_home: Option<CodexHome>,
     pub store_path: Option<PathBuf>,
 }
 
@@ -293,6 +298,9 @@ pub fn upsert_account(app_data_dir: &Path, mut account: ProviderAccount) -> io::
     account.credential.refresh_token = account.credential.refresh_token.and_then(normalize_secret);
     account.credential.session_key = account.credential.session_key.and_then(normalize_secret);
 
+    let _mutation = STORE_MUTATION
+        .lock()
+        .map_err(|_| io::Error::other("provider account store unavailable"))?;
     let path = store_path(app_data_dir);
     let instance_id = account.instance_id.clone();
     let _lock = lock_store(&path)?;
@@ -304,6 +312,9 @@ pub fn upsert_account(app_data_dir: &Path, mut account: ProviderAccount) -> io::
 }
 
 pub fn delete_account(app_data_dir: &Path, instance_id: &str) -> io::Result<()> {
+    let _mutation = STORE_MUTATION
+        .lock()
+        .map_err(|_| io::Error::other("provider account store unavailable"))?;
     let path = store_path(app_data_dir);
     let _lock = lock_store(&path)?;
     let mut store = load_store_locked(&path)?;
@@ -318,6 +329,9 @@ pub fn update_credential_at_path(
     instance_id: &str,
     update: ProviderCredential,
 ) -> io::Result<Option<ProviderCredential>> {
+    let _mutation = STORE_MUTATION
+        .lock()
+        .map_err(|_| io::Error::other("provider account store unavailable"))?;
     let _lock = lock_store(store_path)?;
     let mut store = load_store_locked(store_path)?;
     let Some(account) = store.accounts.get_mut(instance_id) else {
@@ -356,23 +370,28 @@ mod tests {
 
     #[test]
     #[serial]
-    fn concurrent_account_updates_do_not_replace_unrelated_rows() {
-        provider_accounts_crypto::set_test_master_key(Some([5_u8; 32]));
-        let dir = temp_dir("concurrent-upserts");
-        let workers = 8;
-        let start = std::sync::Barrier::new(workers);
+
+    fn concurrent_home_registration_preserves_other_accounts() {
+        provider_accounts_crypto::set_test_master_key(Some([7_u8; 32]));
+        let dir = temp_dir("concurrent-registrations");
+        let barrier = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
-            for index in 0..workers {
-                let start = &start;
+            for n in 0..4 {
                 let dir = &dir;
+                let barrier = &barrier;
                 scope.spawn(move || {
-                    start.wait();
+                    barrier.wait();
                     upsert_account(
                         dir,
                         ProviderAccount {
-                            instance_id: format!("claude:{index}"),
-                            base_provider_id: "claude".into(),
-                            label: format!("Account {index}"),
+                            instance_id: format!("codex:{n}"),
+                            base_provider_id: "codex".into(),
+                            label: format!("Account {n}"),
+                            codex_home: Some(CodexHome {
+                                path: dir.join(format!("home-{n}")),
+                                account_id: format!("account-{n}"),
+                            }),
+
                             credential: ProviderCredential::default(),
                         },
                     )
@@ -380,9 +399,20 @@ mod tests {
                 });
             }
         });
-        assert_eq!(load_store(&dir).unwrap().accounts.len(), workers);
-        let _ = fs::remove_dir_all(dir);
+
+        let store = load_store(&dir).unwrap();
+        assert_eq!(store.accounts.len(), 4);
+        for n in 0..4 {
+            let account = &store.accounts[&format!("codex:{n}")];
+            assert!(account.credential.is_empty());
+            assert_eq!(
+                account.codex_home.as_ref().unwrap().account_id,
+                format!("account-{n}")
+            );
+        }
         provider_accounts_crypto::set_test_master_key(None);
+        fs::remove_dir_all(dir).unwrap();
+
     }
 
     #[test]
@@ -396,6 +426,7 @@ mod tests {
                 instance_id: "claude:work".into(),
                 base_provider_id: "claude".into(),
                 label: "Work".into(),
+                codex_home: None,
                 credential: ProviderCredential {
                     access_token: Some("old".into()),
                     refresh_token: None,
@@ -452,6 +483,7 @@ mod tests {
                     instance_id: "cursor:work".into(),
                     base_provider_id: "cursor".into(),
                     label: "Work".into(),
+                    codex_home: None,
                     credential: ProviderCredential {
                         access_token: Some("secret-token".into()),
                         refresh_token: None,

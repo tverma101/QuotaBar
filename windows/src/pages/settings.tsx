@@ -26,6 +26,8 @@ import { ProviderIcon } from "@/components/provider-icon";
 import { GlobalShortcutSection } from "@/components/global-shortcut-section";
 import { LanguageRegionSection } from "@/components/settings/language-region-section";
 import { ScreenShareSection } from "@/components/settings/screen-share-section";
+import { CodexEnrollment, type RegisteredCodexAccount } from "@/components/settings/codex-enrollment";
+import { CodexAutoResetSetting } from "@/components/settings/codex-auto-reset-setting";
 import { getBarFillLayout } from "@/lib/tray-bars-icon";
 import { getTrayIconSizePx } from "@/lib/tray-icon-size";
 import {
@@ -105,6 +107,7 @@ const PREVIEW_BAR_TRACK_PX = 20;
 
 export type ProviderAccountCredentialInput = {
   label?: string;
+  registeredInstanceId?: string;
   accessToken: string;
   refreshToken: string;
   sessionKey: string;
@@ -781,6 +784,11 @@ function ResetAllSettingsSection({ onResetComplete }: { onResetComplete: () => v
           await invoke("set_hide_from_screen_share", { enabled: false });
         } catch (e) {
           console.error("clear Hide From Screen Share after reset:", e);
+        }
+        try {
+          await invoke("set_codex_auto_reset_enabled", { value: false });
+        } catch (e) {
+          console.error("clear Codex automatic resets after reset:", e);
         }
       }
       await hydrateModernLayoutStore();
@@ -1492,6 +1500,16 @@ export function SettingsPage({
     setAccountForm(null);
   };
 
+  function addRegisteredCodexAccount({ instanceId, label }: RegisteredCodexAccount) {
+    onAddProviderAccount("codex", {
+      label,
+      registeredInstanceId: instanceId,
+      accessToken: "",
+      refreshToken: "",
+      sessionKey: "",
+    });
+  }
+
   return (
     <div
       className={cn(
@@ -1530,6 +1548,12 @@ export function SettingsPage({
       ) : null}
       {showModernSection("general") ? (
       <>
+      {isTauri() && plugins.some((plugin) => plugin.id === "codex") ? (
+        <div className={cn("space-y-1", modernDensity === "compact" && "space-y-0.5")}>
+          <h4 className="px-2 text-xs font-semibold text-muted-foreground">Codex Accounts</h4>
+          <CodexEnrollment label="" onRegistered={addRegisteredCodexAccount} presentation="settings" />
+        </div>
+      ) : null}
       <LanguageRegionSection
         appLocale={appLocale}
         displayCurrency={displayCurrency}
@@ -1629,6 +1653,7 @@ export function SettingsPage({
           </div>
         </div>
       </section>
+      {isTauri() ? <CodexAutoResetSetting /> : null}
       <section>
         <h3 className="text-lg font-semibold mb-0">{t("settings.timeFormat.title")}</h3>
         <p className="text-sm text-muted-foreground mb-2">
@@ -2235,6 +2260,15 @@ export function SettingsPage({
                   accountFormSlot={
                     accountForm && accountFormAnchorPluginId(accountForm) === plugin.id ? (
                       <div className="pt-2 mt-2 border-t border-border">
+                        {isTauri() && accountForm.mode === "add" && accountForm.baseProviderId === "codex" ? (
+                          <CodexEnrollment
+                            label={accountForm.label}
+                            onRegistered={(account) => {
+                              addRegisteredCodexAccount(account);
+                              setAccountForm(null);
+                            }}
+                          />
+                        ) : null}
                         <ProviderAccountForm
                           form={accountForm}
                           onChange={setAccountForm}
