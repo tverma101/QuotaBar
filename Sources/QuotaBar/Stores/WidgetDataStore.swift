@@ -329,14 +329,13 @@ final class WidgetDataStore {
         if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
             await freebuff.unloadLocalAccountingCachesForMemoryPressure()
         }
-        if let zai = providersByID["zai"] as? ZAIProvider {
-            await zai.unloadLocalAccountingCachesForMemoryPressure()
-        }
         for provider in providersByID.values {
             if let codex = provider as? CodexProvider {
                 await codex.unloadLocalAccountingCachesForMemoryPressure()
             }
         }
+        // Providers served by the Rust engine keep their recomputable caches there.
+        await RustEngine.unloadCaches()
         // Callers relieve the malloc zone at the end of the chain so one free-list walk covers
         // every unload in the cycle.
     }

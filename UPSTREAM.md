@@ -67,8 +67,10 @@ Local changes that matter when syncing shared code:
    without blocking independent OpenCode history. Completed Router prefixes remain usable through ordinary appends during the wider fold; rewrites and replacements still invalidate them. Preserve these format-compatibility fixes.
 5. **Rust backend (`Rust/quotabar-engine`).** Upstream is Swift-only. QuotaBar is moving provider
    backends into a cross-platform Rust engine linked through `quotabar-core` (see
-   `docs/rust-core.md`): Devin's live refresh, in-process SQLite reads (replacing `/usr/bin/sqlite3`),
-   and `.jsonl.zst` decoding run there today; other providers remain Swift. When syncing an upstream
+   `docs/rust-core.md`): Devin, Copilot, Cursor, Grok, Hermes, OpenRouter, and Z.ai are registered
+   in the engine on macOS, alongside in-process SQLite reads (replacing `/usr/bin/sqlite3`) and
+   `.jsonl.zst` decoding; the Windows port runs Devin's live quota on the same engine while its
+   other providers stay on plugins. When syncing an upstream
    provider fix, check whether that provider now lives in the engine. The SQLite read-only open and
    source-signature techniques are adapted from rsusage (MIT, © 2026 Coobyk,
    https://github.com/coobyk/rsusage); keep that attribution in `Rust/quotabar-engine/src/sqlite.rs`.

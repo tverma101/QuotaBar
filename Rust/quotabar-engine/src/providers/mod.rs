@@ -12,6 +12,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod devin;
+pub mod error_text;
 pub mod grok;
 pub mod hermes;
 pub mod muse;

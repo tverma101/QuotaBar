@@ -260,6 +260,21 @@ enum RustEngine {
         let identityKey: String?
     }
 
+    /// A provider's launch-time cache identity (local state only, no Keychain), or nil when the engine
+    /// could not answer.
+    static func cacheIdentityKey(providerID: String) -> String? {
+        prepare()
+        do {
+            return try callSync(
+                ["method": "cacheIdentityKey", "params": ["providerId": providerID]],
+                as: String.self
+            )
+        } catch {
+            AppLog.error(LogTag.auth(providerID), "cacheIdentityKey failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     static func apiKeyStatus(providerID: String) -> APIKeyStatus {
         prepare()
         struct Reply: Decodable { let status: APIKeyStatus }

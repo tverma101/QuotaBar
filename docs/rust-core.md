@@ -1,9 +1,9 @@
 # Rust core
 
-QuotaBar is a Swift app; the UI and the provider logic stay in Swift. A small set of
-CPU-heavy primitives are implemented in Rust as a static library (`quotabar-core`) and called
-from Swift over a C ABI. This document describes the split, the fallback contract, and how to
-build and extend it.
+QuotaBar's shell is SwiftUI/AppKit; it calls into a Rust core (`quotabar-core`) for CPU-heavy
+primitives and into a shared Rust engine (`quotabar-engine`) for provider backends, over a C ABI
+and a small JSON bridge. The provider port is in progress. This document describes the split, the
+fallback contract, and how to build and extend it.
 
 ## Why a Rust core
 
@@ -19,9 +19,8 @@ Swift reference implementation, and the two are tested against each other.
 
 ## Layout
 
-- `Rust/quotabar-core/` — the crate (edition 2021, `staticlib` + `rlib`). Only dependency:
-  `serde_json`, the vetted parser used rather than a hand-rolled one; it is the minimum needed to
-  deserialize usage lines and nothing else. New crate dependencies need the usual justification
+- `Rust/quotabar-core/` — the crate (edition 2021, `staticlib` + `rlib`). It links quotabar-engine
+  and exposes the C ABI. New crate dependencies need the usual justification
   from AGENTS.md.
 - `Sources/CQuotabarCore/` — a clang target whose header (`include/quotabar_core.h`) declares the
   C ABI the Swift code imports. The `.c` shim is a link probe.
@@ -47,8 +46,9 @@ Swift reference implementation, and the two are tested against each other.
 onto. It is linked into the same static library and called over a small JSON request/reply bridge
 (`Sources/QuotaBar/Engine/RustEngine.swift`). Today it serves:
 
-- **Devin** — the whole live refresh (credentials, API, mapping) runs in the engine; Swift adds the
-  local transcript history on top.
+- **Devin, Copilot, Cursor, Grok, Hermes, OpenRouter, and Z.ai** — the whole live refresh
+  (credentials, API, mapping) runs in the engine. The shell keeps the SwiftUI and the host
+  callbacks (Keychain, environment) the engine reaches for through the bridge.
 - **Local SQLite reads** for every provider that reads another app's database (OpenCode, Freebuff,
   Antigravity, ZCode, Cursor, Hermes, Claude Desktop, the Codex proxy). Reads run in-process instead of launching `/usr/bin/sqlite3`
   per query, open read-only, and stop at a per-query time limit: five seconds by default, thirty for
@@ -59,9 +59,12 @@ The engine asks the app for things only the app can do — Keychain reads and wr
 values — through host callbacks, so a Keychain read still uses the app's signed identity and its
 existing "Always Allow" grants, and is cancelled with the refresh that asked for it.
 
-Not yet moved: the remaining providers' live refreshes and the Claude/Codex/Grok local-history
-scanners still run in Swift (their per-line parsers already use the Rust core above), and the
-scan-worker child process still hosts the heavy history folds.
+On Windows the shared engine powers Devin's live quota; the other Windows providers still run on
+their own adapters and JS plugins, not the shared engine yet.
+
+Not yet moved: Claude, Codex/CodexRouter, Antigravity, Freebuff, and OpenCode live refreshes and
+local-history scanners still run in Swift (only the Claude and Codex per-line parsers use the Rust
+core above), and the scan-worker child process still hosts the heavy history folds.
 
 ## The fallback contract
 

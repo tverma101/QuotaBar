@@ -2,7 +2,7 @@
 
 use super::auth::{
     cache_identity_key, CursorAuthError, CursorAuthSource, CursorAuthState, CursorAuthStore,
-    KeychainBackend, MemorySqlite, ACCESS_TOKEN_KEY, KEYCHAIN_ACCESS_SERVICE,
+    KeychainBackend, MemorySqlite, SqlBackend, ACCESS_TOKEN_KEY, KEYCHAIN_ACCESS_SERVICE,
     KEYCHAIN_REFRESH_SERVICE, MEMBERSHIP_TYPE_KEY, REFRESH_TOKEN_KEY,
 };
 use super::client::{
@@ -327,4 +327,102 @@ fn provider_refresh_live_enterprise_rotation_and_cancellation() {
     assert!(!seen_urls.lock().unwrap().iter().any(|u| u == USAGE_SUMMARY_URL));
 
     let _ = (REST_USAGE_URL, MetricValue::new(0.0, MetricKind::Dollars));
+}
+
+#[test]
+fn refresh_only_sqlite_state_rotates_and_fetches_quota() {
+    let new_jwt = make_jwt(Some("google-oauth2|refresh-user"), Some(1_900_000_000));
+    let sqlite = Arc::new(MemorySqlite::new(HashMap::from([(REFRESH_TOKEN_KEY.into(), "refresh-token".into())])));
+    let store = CursorAuthStore::with_backends(sqlite.clone(), Arc::new(FakeKeychain::default()));
+    assert!(store.has_local_credentials());
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_c = Arc::clone(&seen);
+    let jwt_c = new_jwt.clone();
+    let http = Arc::new(FnClient::new(move |req| {
+        seen_c.lock().unwrap().push(req.url.clone());
+        if req.url == REFRESH_URL {
+            return json_ok(json!({"access_token": jwt_c}));
+        }
+        if req.url == USAGE_URL {
+            let auth = req.headers.iter().find(|(k, _)| k == "Authorization").map(|(_, v)| v.as_str()).unwrap_or("");
+            assert_eq!(auth, format!("Bearer {jwt_c}"));
+            return json_ok(json!({"enabled": true, "planUsage": {"limit": 40000, "remaining": 32000, "totalPercentUsed": 20}}));
+        }
+        Ok(Response { status: 404, headers: Vec::new(), body: Vec::new() })
+    }));
+    let provider = CursorProvider::new(store, http);
+    let mut c = RefreshContext::new(Scope::MenuBar);
+    c.now = NOW;
+    let snap = provider.refresh(&c);
+    assert!(!snap.is_error());
+
+    let urls = seen.lock().unwrap();
+    assert_eq!(urls.first().map(String::as_str), Some(REFRESH_URL));
+    assert!(urls.iter().position(|u| u == USAGE_URL).unwrap() > 0);
+    drop(urls);
+    assert_eq!(sqlite.query_item(ACCESS_TOKEN_KEY).unwrap().as_deref(), Some(new_jwt.as_str()));
+}
+
+#[test]
+fn save_access_token_rejects_access_and_refresh_drift_independently() {
+    let subject = "google-oauth2|user-drift";
+    let original = make_jwt(Some(subject), Some(0));
+    let sqlite = Arc::new(MemorySqlite::new(HashMap::from([
+        (ACCESS_TOKEN_KEY.into(), original.clone()),
+        (REFRESH_TOKEN_KEY.into(), "refresh-1".into()),
+    ])));
+    let store = CursorAuthStore::with_backends(sqlite.clone(), Arc::new(FakeKeychain::default()));
+    let observed = store.load_auth_state(None, NOW, false).unwrap().unwrap();
+    assert_eq!(observed.source, CursorAuthSource::Sqlite);
+
+    // A newer access token landed concurrently: same subject, different expiry.
+    let newer = make_jwt(Some(subject), Some(1_900_000_000));
+    sqlite.write_access_token(&newer).unwrap();
+    assert_eq!(store.save_access_token("ours", &observed, NOW), Err(CursorAuthError::SessionExpired));
+    assert_eq!(sqlite.query_item(ACCESS_TOKEN_KEY).unwrap().as_deref(), Some(newer.as_str()));
+
+    // The original access token restored but a rotated refresh token is rejected too.
+    sqlite.write_access_token(&original).unwrap();
+    sqlite.values.lock().unwrap().insert(REFRESH_TOKEN_KEY.into(), "refresh-2".into());
+    assert_eq!(store.save_access_token("ours", &observed, NOW), Err(CursorAuthError::SessionExpired));
+    assert_eq!(sqlite.query_item(ACCESS_TOKEN_KEY).unwrap().as_deref(), Some(original.as_str()));
+}
+
+#[test]
+fn usage_export_window_starts_at_local_midnight_thirty_days_back() {
+    let zone = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+    let now = crate::time::parse_iso8601("2026-11-24T19:15:00Z").unwrap();
+    let start = super::usage_export_start(now, &zone).unwrap();
+    assert_eq!(start, crate::time::parse_iso8601("2026-10-26T05:00:00Z").unwrap());
+    assert_eq!(super::usage_export_start(f64::NAN, &zone), None);
+}
+
+#[test]
+fn invalid_utf8_usage_csv_is_dropped_without_spend_lines() {
+    let access_tok = make_jwt(Some("google-oauth2|utf8-user"), Some(1_900_000_000));
+    let sqlite = Arc::new(MemorySqlite::new(HashMap::from([(ACCESS_TOKEN_KEY.into(), access_tok)])));
+    let csv = format!(
+        "Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost\n{},modelXname,No,0,1000,0,100,0.01\n",
+        crate::time::format_iso8601(NOW)
+    );
+    let mut body = csv.into_bytes();
+    let pos = body.iter().position(|b| *b == b'X').unwrap();
+    body[pos] = 0xff;
+    let http = Arc::new(FnClient::new(move |req| {
+        assert!(req.url.starts_with(EXPORT_CSV_URL));
+        Ok(Response { status: 200, headers: Vec::new(), body: body.clone() })
+    }));
+    let provider = CursorProvider::new(
+        CursorAuthStore::with_backends(sqlite, Arc::new(FakeKeychain::default())),
+        http,
+    )
+    .with_pricing_override(Arc::new(crate::pricing::ModelPricing::default()));
+    let mut c = RefreshContext::new(Scope::PanelAccounting);
+    c.now = NOW;
+    let snap = provider.refresh(&c);
+    assert!(snap.usage_history.is_none());
+    assert!(snap.lines.iter().all(|l| {
+        !matches!(l, MetricLine::Values { values, .. } if values.iter().any(|v| v.kind == MetricKind::Dollars))
+    }));
 }

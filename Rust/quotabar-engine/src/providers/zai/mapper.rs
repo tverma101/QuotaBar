@@ -11,8 +11,8 @@ use serde_json::{Map, Value};
 pub const MAXIMUM_RESET_HORIZON_SECS: f64 = 2.0 * 365.0 * 24.0 * 3600.0;
 pub const MONTHLY_PERIOD_MS: i64 = 30 * DAY_MS;
 
-pub const INVALID_RESPONSE_ERROR: &str = "Z.ai returned an unexpected response.";
-pub const NO_CODING_PLAN_ERROR: &str = "This account doesn't have an active GLM Coding Plan.";
+pub const INVALID_RESPONSE_ERROR: &str = super::super::error_text::INVALID_RESPONSE;
+pub const NO_CODING_PLAN_ERROR: &str = "No active GLM Coding Plan. Subscribe at z.ai/subscribe to see usage.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapperError {

@@ -137,4 +137,14 @@ final class RustEngineBridgeTests: XCTestCase {
         guard case .failure(let error) = reply else { return XCTFail("expected a failure") }
         XCTAssertEqual(error.localizedDescription, "unknown method: definitely-not-a-method")
     }
+
+    func testCursorAndZAIAreRegisteredInTheLinkedEngine() async throws {
+        RustEngine.prepare()
+        struct ProviderEntry: Decodable { let id: String }
+        struct RegistryReply: Decodable { let ok: [ProviderEntry] }
+        let data = try await RustEngine.call(["method": "providers"]).get()
+        let ids = Set(try JSONDecoder().decode(RegistryReply.self, from: data).ok.map(\.id))
+        XCTAssertTrue(ids.contains("cursor"))
+        XCTAssertTrue(ids.contains("zai"))
+    }
 }

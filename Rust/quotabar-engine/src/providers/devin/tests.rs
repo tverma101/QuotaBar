@@ -465,3 +465,27 @@ fn legacy_windsurf_state_is_used_when_devin_app_is_absent() {
     let sent: Value = serde_json::from_slice(http.requests.lock().unwrap()[0].body.as_ref().unwrap()).unwrap();
     assert_eq!(sent["metadata"]["apiKey"], "windsurf-key");
 }
+
+#[test]
+fn explicit_key_never_falls_back_to_machine_credentials() {
+    let fixture = Fixture::new();
+    fixture.write_credentials("windsurf_api_key = \"devin-session-token$cli\"");
+    fixture.write_app_auth(r#"{"apiKey":"devin-session-token$app"}"#);
+    let http = MockClient::new(vec![MockClient::json(401, "{}")]);
+    let provider = fixture.provider(http.clone());
+
+    let mut context = RefreshContext::new(Scope::PanelMeters);
+    context.now = NOW;
+    let snapshot = provider.refresh_with_api_key(&context, Some("explicit"), None);
+    assert_eq!(snapshot.error_category, Some(ErrorCategory::NotLoggedIn));
+    {
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(sent["metadata"]["apiKey"], "explicit");
+    }
+
+    let snapshot = provider.refresh_with_api_key(&context, Some("   "), None);
+    assert_eq!(snapshot.error_category, Some(ErrorCategory::NotLoggedIn));
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+}

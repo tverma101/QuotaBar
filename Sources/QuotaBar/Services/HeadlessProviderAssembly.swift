@@ -135,14 +135,14 @@ struct HeadlessProviderAssembly {
         // when something actually asks. `nil` keeps the CLI's catalog-wide read.
         if identityKeyProviderIDs == nil {
             providerIdentityKeys["cursor"] = await loadOffMainActor {
-                CursorAuthStore().cacheIdentityKeyForLaunch()
+                CursorProvider.cacheIdentityKeyForLaunch()
             }
             providerIdentityKeys["antigravity"] = await loadOffMainActor {
                 AntigravityAuthStore().cacheIdentityKeyForLaunch()
             }
         } else {
             deferredIdentityKeyLoaders["cursor"] = {
-                await loadOffMainActor { CursorAuthStore().cacheIdentityKeyForLaunch() }
+                await loadOffMainActor { CursorProvider.cacheIdentityKeyForLaunch() }
             }
             deferredIdentityKeyLoaders["antigravity"] = {
                 await loadOffMainActor { AntigravityAuthStore().cacheIdentityKeyForLaunch() }

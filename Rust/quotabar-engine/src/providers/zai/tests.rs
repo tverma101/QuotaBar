@@ -8,7 +8,7 @@ use crate::context::{RefreshContext, Scope};
 use crate::host::{self, Host, LogLevel, SecureReadOutcome, SecureReadRequest};
 use crate::http::mock::{FnClient, MockClient};
 use crate::http::{HttpError, Response};
-use crate::model::{ErrorCategory, MetricKind, MetricLine, MetricValue, ProgressFormat};
+use crate::model::{ErrorCategory, MetricKind, MetricLine, MetricValue, ProgressFormat, ProviderSnapshot};
 use crate::providers::api_key::{ApiKeyStatus, ReadKeyError};
 use crate::providers::ProviderRuntime;
 use crate::sqlite::execute as sqlite_execute;
@@ -16,6 +16,7 @@ use crate::time::DISTANT_PAST;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 const QUOTA_BOTH: &str = r#"{"data":{"limits":[
@@ -67,6 +68,13 @@ fn ctx(now: f64) -> RefreshContext {
     let mut c = RefreshContext::new(Scope::Full);
     c.now = now;
     c
+}
+
+fn error_badge(snap: &ProviderSnapshot) -> Option<String> {
+    match snap.lines.first() {
+        Some(MetricLine::Badge { text, .. }) => Some(text.clone()),
+        _ => None,
+    }
 }
 
 #[test]
@@ -241,21 +249,36 @@ fn provider_refresh_plan_cache_failures_and_scopes() {
         assert_eq!(*cancel_urls.lock().unwrap(), vec![QUOTA_URL.to_string()]);
 
         let http_401 = MockClient::new(vec![Ok(Response { status: 401, headers: Vec::new(), body: b"{}".to_vec() }), Ok(ok_json(SUBSCRIPTION))]);
-        assert_eq!(ZAIProvider::new(spec.clone(), http_401, empty_scanner(&dir)).refresh(&ctx(NOW)).error_category, Some(ErrorCategory::AuthInvalid));
+        let snap_401 = ZAIProvider::new(spec.clone(), http_401, empty_scanner(&dir)).refresh(&ctx(NOW));
+        assert_eq!(snap_401.error_category, Some(ErrorCategory::AuthInvalid));
+        assert_eq!(error_badge(&snap_401).as_deref(), Some("Z.ai API key invalid. Check your key at z.ai/manage-apikey/apikey-list."));
 
         let http_500 = MockClient::new(vec![Ok(Response { status: 500, headers: Vec::new(), body: b"{}".to_vec() }), Ok(ok_json(SUBSCRIPTION))]);
-        assert_eq!(ZAIProvider::new(spec.clone(), http_500, empty_scanner(&dir)).refresh(&ctx(NOW)).error_category, Some(ErrorCategory::Http5xx));
+        let snap_500 = ZAIProvider::new(spec.clone(), http_500, empty_scanner(&dir)).refresh(&ctx(NOW));
+        assert_eq!(snap_500.error_category, Some(ErrorCategory::Http5xx));
+        assert_eq!(error_badge(&snap_500).as_deref(), Some("Usage request failed (HTTP 500). Try again later."));
 
-        let http_net = MockClient::new(vec![Err(HttpError::Transport("down".into()))]);
-        assert_eq!(ZAIProvider::new(spec.clone(), http_net, empty_scanner(&dir)).refresh(&ctx(NOW)).error_category, Some(ErrorCategory::Network));
+        let http_net = MockClient::new(vec![Err(HttpError::Transport("down".into())), Ok(ok_json(SUBSCRIPTION))]);
+        let net_snap = ZAIProvider::new(spec.clone(), http_net.clone(), empty_scanner(&dir)).refresh(&ctx(NOW));
+        assert_eq!(net_snap.error_category, Some(ErrorCategory::Network));
+        assert_eq!(error_badge(&net_snap).as_deref(), Some("Usage request failed. Check your connection."));
+        {
+            let requests = http_net.requests.lock().unwrap();
+            let urls: Vec<&str> = requests.iter().map(|r| r.url.as_str()).collect();
+            assert_eq!(urls, vec![QUOTA_URL, SUBSCRIPTION_URL]);
+            assert!(requests.iter().all(|r| r.timeout == Duration::from_secs(15)));
+        }
 
         let http_ncp = MockClient::new(vec![Ok(ok_json(r#"{"code":500,"msg":"当前用户不存在coding plan","success":false}"#)), Ok(ok_json(SUBSCRIPTION))]);
         let ncp_snap = ZAIProvider::new(spec.clone(), http_ncp, empty_scanner(&dir)).refresh(&ctx(NOW));
         assert_eq!(ncp_snap.error_category, Some(ErrorCategory::NotAvailable));
+        assert_eq!(error_badge(&ncp_snap).as_deref(), Some("No active GLM Coding Plan. Subscribe at z.ai/subscribe to see usage."));
         assert_eq!(ncp_snap.clears_prior_menu_bar_quota_state, Some(true));
 
         let http_bad_limit = MockClient::new(vec![Ok(ok_json(r#"{"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5}]}}"#)), Ok(ok_json(r#"{"data":[]}"#))]);
-        assert_eq!(ZAIProvider::new(spec.clone(), http_bad_limit, empty_scanner(&dir)).refresh(&ctx(NOW)).error_category, Some(ErrorCategory::Decoding));
+        let bad_snap = ZAIProvider::new(spec.clone(), http_bad_limit, empty_scanner(&dir)).refresh(&ctx(NOW));
+        assert_eq!(bad_snap.error_category, Some(ErrorCategory::Decoding));
+        assert_eq!(error_badge(&bad_snap).as_deref(), Some("Usage response invalid. Try again later."));
 
         let mut fold_ctx = ctx(NOW);
         fold_ctx.scope = Scope::PanelAccounting;

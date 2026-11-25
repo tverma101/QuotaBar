@@ -29,9 +29,20 @@ const REFRESH_LEEWAY_SECS: f64 = 300.0;
 
 static UNRESOLVED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// A per-launch identity that can never match a previous launch's history (Swift uses a fresh UUID):
+/// a process nonce from the launch time and pid, plus a counter for keys made within one launch.
 pub fn new_unresolved_identity_key() -> String {
+    static LAUNCH_NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let nonce = LAUNCH_NONCE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let seed = format!("{nanos}-{}-{:p}", std::process::id(), &UNRESOLVED_COUNTER);
+        sha256_hex(seed.as_bytes())[..32].to_string()
+    });
     let seq = UNRESOLVED_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("cursor-unresolved-{seq}")
+    format!("cursor-unresolved-{nonce}-{seq}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,7 +220,7 @@ impl CursorAuthStore {
         let membership = self.read_membership_type();
         let sqlite_can_auth = sqlite_state
             .as_ref()
-            .is_some_and(|s| !is_token_expired(&s.access_token, now) || s.refresh_token.is_some());
+            .is_some_and(|s| (!s.access_token.is_empty() && !is_token_expired(&s.access_token, now)) || s.refresh_token.is_some());
         let sqlite_looks_free = membership.as_deref() == Some("free");
 
         if sqlite_can_auth && !sqlite_looks_free {
@@ -284,13 +295,20 @@ impl CursorAuthStore {
         replacing: &CursorAuthState,
         now: f64,
     ) -> Result<(), CursorAuthError> {
-        let current = match self.load_auth_state(None, now, false) {
+        let current = match self.load_auth_state(
+            None,
+            now,
+            replacing.source == CursorAuthSource::Keychain && replacing.refresh_token.is_some(),
+        ) {
             Ok(Some(c)) => c,
             Ok(None) => return Err(CursorAuthError::SessionExpired),
             Err(CursorAuthError::Cancelled) => return Err(CursorAuthError::Cancelled),
             Err(_) => return Err(CursorAuthError::SessionExpired),
         };
-        if current.source != replacing.source || !same_account(&current, replacing) {
+        if current.source != replacing.source
+            || current.access_token != replacing.access_token
+            || current.refresh_token != replacing.refresh_token
+        {
             return Err(CursorAuthError::SessionExpired);
         }
         match replacing.source {
@@ -314,16 +332,38 @@ impl CursorAuthStore {
         Ok(())
     }
 
+    /// Non-secret history-cache identity at launch, from Cursor's state database only (never the
+    /// Keychain). Free accounts can select a different Keychain token than the SQLite one, and a
+    /// database that cannot authenticate (no refresh token, expired access token) proves nothing, so
+    /// both get a per-launch identity that cannot reuse an unverified user's history.
     pub fn cache_identity_key_for_launch(&self) -> String {
-        let Ok(Some(mut state)) = self.read_sqlite_snapshot() else {
-            return new_unresolved_identity_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or_default();
+        self.launch_identity_key(now).unwrap_or_else(new_unresolved_identity_key)
+    }
+
+    fn launch_identity_key(&self, now: f64) -> Option<String> {
+        let read = |key: &str| -> Result<Option<String>, String> {
+            Ok(self.sql.query_item(key)?.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
         };
-        let membership = self.read_membership_type();
+        let membership = read(MEMBERSHIP_TYPE_KEY).ok()?.map(|m| m.to_lowercase());
         if membership.as_deref() == Some("free") {
-            return new_unresolved_identity_key();
+            return None;
         }
-        state.membership_type = membership;
-        cache_identity_key(&state).unwrap_or_else(new_unresolved_identity_key)
+        let access = read(ACCESS_TOKEN_KEY).ok()?;
+        let refresh = read(REFRESH_TOKEN_KEY).ok()?;
+        let can_authenticate =
+            refresh.is_some() || access.as_deref().is_some_and(|token| !is_token_expired(token, now));
+        if !can_authenticate {
+            return None;
+        }
+        if let Some(sub) = access.as_deref().and_then(token_subject) {
+            return Some(format!("cursor-{}", sha256_hex(sub.as_bytes())));
+        }
+        let credential = refresh.or(access)?;
+        Some(format!("cursor-credential-{}", sha256_hex(credential.as_bytes())))
     }
 
     fn read_sqlite_snapshot(&self) -> Result<Option<CursorAuthState>, ()> {
@@ -333,18 +373,17 @@ impl CursorAuthStore {
             .map_err(|_| ())?
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let Some(access_token) = access else {
-            return Ok(None);
-        };
         let refresh_token = self
             .sql
             .query_item(REFRESH_TOKEN_KEY)
-            .ok()
-            .flatten()
+            .map_err(|_| ())?
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        if access.is_none() && refresh_token.is_none() {
+            return Ok(None);
+        }
         Ok(Some(CursorAuthState {
-            access_token,
+            access_token: access.unwrap_or_default(),
             refresh_token,
             membership_type: None,
             source: CursorAuthSource::Sqlite,
@@ -409,14 +448,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
-}
-
-fn same_account(a: &CursorAuthState, b: &CursorAuthState) -> bool {
-    match (token_subject(&a.access_token), token_subject(&b.access_token)) {
-        (Some(sa), Some(sb)) => sa == sb,
-        (None, None) => a.access_token == b.access_token,
-        _ => false,
-    }
 }
 
 /// In-memory SQLite stub for unit tests (shared with `tests.rs`).

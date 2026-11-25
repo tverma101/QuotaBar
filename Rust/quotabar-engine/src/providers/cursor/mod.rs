@@ -14,12 +14,14 @@ mod tests;
 
 use super::auth_retry::{fetch_with_retry, RetryOutcome};
 use super::{cancelled_snapshot, ProviderRuntime};
+use crate::accounting::UsageHistoryWindow;
 use crate::context::RefreshContext;
 use crate::host::{diagnostic_gate, plugin_tag};
 use crate::http::{self, HttpClient, HttpError};
 use crate::model::{ErrorCategory, ProviderInfo, ProviderSnapshot};
 use crate::pricing::{self, ModelPricing};
 use crate::{parse, qlog};
+use chrono::{DateTime, Days, Local, TimeDelta, TimeZone};
 use auth::{
     cache_identity_key, is_token_expired, new_unresolved_identity_key, token_subject, CursorAuthError,
     CursorAuthSource, CursorAuthState, CursorAuthStore,
@@ -32,7 +34,6 @@ use serde_json::{Map, Value};
 use std::sync::{Arc, Mutex};
 
 pub const ID: &str = "cursor";
-const THIRTY_DAYS_SECS: f64 = 30.0 * 24.0 * 3600.0;
 
 #[derive(Clone, Default)]
 struct SpendCache {
@@ -78,12 +79,7 @@ impl CursorProvider {
 
     fn probe(&self, initial_state: &CursorAuthState, ctx: &RefreshContext) -> ProviderSnapshot {
         let mut auth_state = initial_state.clone();
-        if is_token_expired(&auth_state.access_token, ctx.now) {
-            if auth_state.refresh_token.is_none() {
-                if let Ok(Some(reloaded)) = self.auth.load_auth_state(None, ctx.now, true) {
-                    auth_state = reloaded;
-                }
-            }
+        if auth_state.access_token.is_empty() || is_token_expired(&auth_state.access_token, ctx.now) {
             match self.rotate_token(&mut auth_state, ctx, false) {
                 Ok(()) => {}
                 Err(snap) => return snap,
@@ -187,7 +183,11 @@ impl CursorProvider {
             return cancelled_snapshot(&self.info, ctx);
         }
         let end = ctx.now;
-        let resp = match client::fetch_usage_csv(self.http.as_ref(), access_token, end - THIRTY_DAYS_SECS, end, &ctx.cancel) {
+        let Some(start) = usage_export_start(end, &Local) else {
+            optional::log_optional_warning("csv", "usage-csv", "window", "usage CSV calendar window could not be determined");
+            return ProviderSnapshot::new(&self.info, mapped.plan, mapped.lines, ctx.now);
+        };
+        let resp = match client::fetch_usage_csv(self.http.as_ref(), access_token, start, end, &ctx.cancel) {
             Ok(Some(r)) if r.is_success() => r,
             Err(HttpError::Cancelled) => return cancelled_snapshot(&self.info, ctx),
             Ok(Some(r)) => {
@@ -199,7 +199,10 @@ impl CursorProvider {
         if ctx.is_cancelled() {
             return cancelled_snapshot(&self.info, ctx);
         }
-        let csv_text = String::from_utf8_lossy(&resp.body);
+        let Ok(csv_text) = std::str::from_utf8(&resp.body) else {
+            optional::log_optional_warning("csv", "usage-csv", "utf8", "usage CSV response was not valid UTF-8");
+            return ProviderSnapshot::new(&self.info, mapped.plan, mapped.lines, ctx.now);
+        };
         let owned_pricing;
         let pricing = match self.pricing_override.as_deref() {
             Some(p) => p,
@@ -208,7 +211,7 @@ impl CursorProvider {
                 &owned_pricing
             }
         };
-        let parsed = match csv::parse_usage_csv(&csv_text, pricing, end + csv::FUTURE_TOLERANCE_SECONDS, &ctx.cancel) {
+        let parsed = match csv::parse_usage_csv(csv_text, pricing, end + csv::FUTURE_TOLERANCE_SECONDS, &ctx.cancel) {
             Ok(p) => p,
             Err(_) => {
                 optional::log_optional_warning("csv", "usage-csv", "malformed", "optional usage CSV response could not be parsed");
@@ -231,17 +234,19 @@ impl CursorProvider {
         } else {
             diagnostic_gate::clear("auth.cursor.csv.unpriced-grok-bot");
         }
-        optional::clear_optional_warnings("csv", "usage-csv", &["malformed", "partial"]);
+        optional::clear_optional_warnings("csv", "usage-csv", &["malformed", "partial", "utf8", "window"]);
         let history = append_spend_lines(&parsed.rows, end, pricing, &mut mapped.lines);
         self.spend_cache.lock().unwrap_or_else(|e| e.into_inner()).usage_history = Some(history.clone());
         ProviderSnapshot::new(&self.info, mapped.plan, mapped.lines, ctx.now).with_usage_history(Some(history))
     }
 
     fn rotate_token(&self, auth_state: &mut CursorAuthState, ctx: &RefreshContext, force_keychain_refresh: bool) -> Result<(), ProviderSnapshot> {
-        if force_keychain_refresh && auth_state.refresh_token.is_none() {
+        if auth_state.source == CursorAuthSource::Keychain && (force_keychain_refresh || auth_state.refresh_token.is_none()) {
             match self.auth.load_auth_state(Some(ctx), ctx.now, true) {
-                Ok(Some(reloaded)) => *auth_state = reloaded,
-                Ok(None) => return Err(ProviderSnapshot::error(&self.info, CursorAuthError::NotLoggedIn.message(), ErrorCategory::NotLoggedIn, ctx.now)),
+                Ok(Some(reloaded)) if reloaded.source == auth_state.source
+                    && reloaded.access_token == auth_state.access_token
+                    && (auth_state.refresh_token.is_none() || reloaded.refresh_token == auth_state.refresh_token) => *auth_state = reloaded,
+                Ok(_) => return Err(ProviderSnapshot::error(&self.info, CursorAuthError::SessionExpired.message(), ErrorCategory::AuthExpired, ctx.now)),
                 Err(CursorAuthError::Cancelled) => return Err(cancelled_snapshot(&self.info, ctx)),
                 Err(err) => return Err(ProviderSnapshot::error(&self.info, err.message(), map_auth_err(&err), ctx.now)),
             }
@@ -314,6 +319,24 @@ impl ProviderRuntime for CursorProvider {
         }
         self.probe(&state, ctx)
     }
+}
+
+fn usage_export_start(now: f64, zone: &impl TimeZone) -> Option<f64> {
+    if !now.is_finite() {
+        return None;
+    }
+    let date = DateTime::from_timestamp(now.floor() as i64, 0)?
+        .with_timezone(zone)
+        .date_naive()
+        .checked_sub_days(Days::new(UsageHistoryWindow::PREVIOUS_DAYS as u64))?;
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    // Some local zones skip midnight on a clock transition.
+    (0..=24 * 60)
+        .find_map(|minutes| {
+            zone.from_local_datetime(&midnight.checked_add_signed(TimeDelta::minutes(minutes))?)
+                .earliest()
+        })
+        .map(|start| start.timestamp() as f64)
 }
 
 pub(super) fn json_object(bytes: &[u8]) -> Option<Map<String, Value>> {

@@ -13,10 +13,10 @@ pub const CONFIG_PATHS: [&str; 3] = [
 pub const ENV_NAMES: [&str; 2] = ["ZAI_API_KEY", "GLM_API_KEY"];
 
 pub const MISSING_KEY_ERROR: &str =
-    "No Z.ai API key. Set ZAI_API_KEY (or GLM_API_KEY) or add it to ~/.config/quotabar/zai.json.";
+    "No Z.ai API key. Set ZAI_API_KEY or add it to ~/.config/quotabar/zai.json.";
 pub const CREDENTIALS_UNREADABLE_ERROR: &str =
     "Couldn't read the saved Z.ai API key. Check the config file permissions, then refresh again.";
-pub const INVALID_KEY_ERROR: &str = "Z.ai API key invalid or expired.";
+pub const INVALID_KEY_ERROR: &str = "Z.ai API key invalid. Check your key at z.ai/manage-apikey/apikey-list.";
 pub const SAVE_FAILED_ERROR: &str = "Couldn't save the Z.ai API key.";
 pub const DELETE_FAILED_ERROR: &str = "Couldn't remove the saved Z.ai API key.";
 

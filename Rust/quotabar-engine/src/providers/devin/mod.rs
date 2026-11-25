@@ -64,6 +64,7 @@ impl DevinProvider {
         DevinProvider::new(DevinAuthStore::live(), http::shared())
     }
 
+    /// An explicit key belongs to the caller's account; never fall back to machine credentials.
     pub fn refresh_with_api_key(
         &self,
         ctx: &RefreshContext,
@@ -72,6 +73,21 @@ impl DevinProvider {
     ) -> ProviderSnapshot {
         if ctx.scope.suppresses_live_quota() {
             return self.local_only_snapshot(ctx);
+        }
+
+        let error = |message: &str, category| ProviderSnapshot::error(&self.info, message, category, ctx.now);
+        if let Some(api_key) = api_key {
+            let api_key = api_key.trim();
+            if api_key.is_empty() {
+                return error(NOT_LOGGED_IN, ErrorCategory::NotLoggedIn);
+            }
+            let auth = DevinAuth { api_key: api_key.into(), api_server_url: None };
+            return match attempt(self.http.as_ref(), &auth, ctx, deadline) {
+                Attempt::Success(mapped) => self.finish_snapshot(mapped, ctx),
+                Attempt::AuthFailure => error(NOT_LOGGED_IN, ErrorCategory::NotLoggedIn),
+                Attempt::Failed(failure) => error(&failure.message(), failure.category()),
+                Attempt::Cancelled => cancelled_snapshot(&self.info, ctx),
+            };
         }
 
         let mut saw_api_key = false;
@@ -101,11 +117,7 @@ impl DevinProvider {
             }
         };
 
-        let credential = match api_key.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(api_key) => Ok(Some(DevinAuth { api_key: api_key.into(), api_server_url: None })),
-            None => self.auth.load_credentials_file(),
-        };
-        match credential {
+        match self.auth.load_credentials_file() {
             Ok(Some(auth)) => {
                 if let Some(snapshot) = try_auth(auth, self) {
                     return snapshot;
@@ -129,7 +141,6 @@ impl DevinProvider {
             }
         }
 
-        let error = |message: &str, category| ProviderSnapshot::error(&self.info, message, category, ctx.now);
         if source_unreadable {
             return error(CREDENTIALS_UNREADABLE, ErrorCategory::CredentialAccess);
         }

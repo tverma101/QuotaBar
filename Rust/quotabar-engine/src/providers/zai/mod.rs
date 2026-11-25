@@ -9,6 +9,7 @@ pub mod zcode_leveldb;
 mod tests;
 
 use super::api_key::{ApiKeySpec, ApiKeyStatus};
+use super::error_text;
 use super::{cancelled_snapshot, ProviderRuntime};
 use crate::accounting::{append_token_usage, TokenUsageOptions};
 use crate::context::RefreshContext;
@@ -33,7 +34,7 @@ pub const QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://api.z.ai/api/biz/subscription/list";
 pub const PLAN_CACHE_INTERVAL_SECS: f64 = 3600.0;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOURCE_NOTE: &str = "From your ZCode usage history";
 const ZCODE_FAILURE_GATE_KEY: &str = "auth.zai.quota-with-zcode.failure";
 
@@ -97,17 +98,9 @@ impl ZAIProvider {
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Accept", "application/json")
             .timeout(REQUEST_TIMEOUT);
-        let quota_resp = match self.http.send(&quota_req, &ctx.cancel) {
-            Ok(resp) => resp,
+        let quota_result = match self.http.send(&quota_req, &ctx.cancel) {
             Err(HttpError::Cancelled) => return cancelled_snapshot(&self.info, ctx),
-            Err(_) => {
-                return ProviderSnapshot::error(
-                    &self.info,
-                    "Couldn't reach Z.ai. Check your connection.",
-                    ErrorCategory::Network,
-                    ctx.now,
-                )
-            }
+            result => result,
         };
         if ctx.is_cancelled() {
             return cancelled_snapshot(&self.info, ctx);
@@ -118,13 +111,17 @@ impl ZAIProvider {
             Err(()) => return cancelled_snapshot(&self.info, ctx),
         };
 
+        let quota_resp = match quota_result {
+            Ok(response) => response,
+            Err(_) => return ProviderSnapshot::error(&self.info, error_text::CONNECTION_FAILED, ErrorCategory::Network, ctx.now),
+        };
         if quota_resp.status == 401 || quota_resp.status == 403 {
             return ProviderSnapshot::error(&self.info, auth::INVALID_KEY_ERROR, ErrorCategory::AuthInvalid, ctx.now);
         }
         if !quota_resp.is_success() {
             return ProviderSnapshot::error(
                 &self.info,
-                &format!("Z.ai request failed (HTTP {}).", quota_resp.status),
+                &error_text::request_failed(quota_resp.status),
                 ErrorCategory::http(quota_resp.status),
                 ctx.now,
             );
