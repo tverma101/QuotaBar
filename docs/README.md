@@ -1,6 +1,6 @@
 # QuotaBar Documentation
 
-What the app does and how it behaves on macOS and Windows. These pages describe **behavior, not visuals**, and they are updated together with any change to that behavior — if the app and a page here disagree, that's a bug. Most behavior pages were written around the macOS menu-bar app; platform-specific Windows installation, tray behavior, and architecture are documented in [QuotaBar for Windows](../windows/README.md).
+Most behavior pages cover the macOS menu-bar app. For the Windows installer, tray dashboard, and local data locations, start with [QuotaBar for Windows](../windows/README.md). For shipped changes and downloads, see the [changelog](../CHANGELOG.md) and [GitHub Releases](https://github.com/tverma101/QuotaBar/releases).
 
 ## The app
 
@@ -16,7 +16,7 @@ What the app does and how it behaves on macOS and Windows. These pages describe 
 ## Integrations
 
 - [Command-line interface](cli.md) — one-shot cached and forced usage reads for agents and scripts
-- [Local HTTP API](local-http-api.md) — read your usage from other apps on `127.0.0.1:6736`
+- Local HTTP API — read your usage from other apps on `127.0.0.1:6736`. [macOS](local-http-api.md) · [Windows](../windows/docs/local-http-api.md)
 - [Proxy](proxy.md) — route provider requests through SOCKS5 or HTTP(S)
 
 ## Providers
