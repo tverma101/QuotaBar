@@ -15,6 +15,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 mod codex;
+mod engine_ffi;
 mod pricing;
 
 const MAX_ENTRIES_PER_LINE: usize = 64;
@@ -681,7 +682,7 @@ fn build_result(outcome: LineOutcome) -> *mut ClaudeParseResult {
 /// ABI version of this library. Bump when the entry layout changes.
 #[no_mangle]
 pub extern "C" fn qb_core_version() -> u32 {
-    2
+    3
 }
 
 /// Parse one Claude usage line.
