@@ -795,14 +795,14 @@ html.tauri-popover body {
   }
 }
 
-/* Remove focus rings - this is a menu bar app, not keyboard-navigated */
-*:focus,
+/* Keep keyboard navigation visible without disturbing pointer-first panel chrome. */
+*:focus {
+  outline: none;
+}
 *:focus-visible {
-  outline: none !important;
-  box-shadow: none !important;
-  --tw-ring-shadow: 0 0 #0000 !important;
-  --tw-ring-offset-shadow: 0 0 #0000 !important;
-  border-color: transparent !important;
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: calc(var(--radius) - 2px);
 }
 
 /* ─── Liquid Glass shimmer animation ─────────────────────────────────────────

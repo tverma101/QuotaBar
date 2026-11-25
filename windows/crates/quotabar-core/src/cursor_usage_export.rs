@@ -34,8 +34,7 @@ const REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
 #[derive(Debug, Clone)]
 pub struct CursorExportAccount {
     pub instance_id: String,
-    pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
+    pub credential: ProviderCredential,
     pub store_path: Option<PathBuf>,
 }
 
@@ -60,8 +59,7 @@ impl CursorExportAccount {
         }
         Some(Self {
             instance_id: instance_id.into(),
-            access_token,
-            refresh_token,
+            credential: credential.clone(),
             store_path,
         })
     }
@@ -77,8 +75,7 @@ impl CursorExportAccount {
                 // the desktop default account's state.vscdb / CLI auth.json.
                 (account.instance_id != account.base_provider_id).then(|| Self {
                     instance_id: account.instance_id.clone(),
-                    access_token: None,
-                    refresh_token: None,
+                    credential: account.credential.clone(),
                     store_path,
                 })
             },
@@ -107,8 +104,7 @@ impl CursorExportAccount {
         }
         (account.instance_id != account.base_provider_id).then(|| Self {
             instance_id: account.instance_id.clone(),
-            access_token: None,
-            refresh_token: None,
+            credential: ProviderCredential::default(),
             store_path: account.store_path.clone(),
         })
     }
@@ -831,19 +827,24 @@ fn resolve_cursor_access_token(
     account: Option<&CursorExportAccount>,
 ) -> Result<String> {
     if let Some(acc) = account {
-        let mut access = acc.access_token.clone();
+        let mut access = CursorExportAccount::non_empty(acc.credential.access_token.as_deref())
+            .or_else(|| CursorExportAccount::non_empty(acc.credential.session_key.as_deref()));
         if needs_refresh(access.as_deref()) {
-            if let Some(ref rt) = acc.refresh_token {
-                if let Some(new_a) = refresh_access_token(rt, None)? {
+            if let Some(rt) = CursorExportAccount::non_empty(acc.credential.refresh_token.as_deref()) {
+                if let Some(new_a) = refresh_access_token(&rt, None)? {
                     if let Some(ref store_path) = acc.store_path {
-                        let _ = provider_accounts::update_credential_at_path(
+                        let updated = provider_accounts::update_credential_at_path(
                             store_path,
                             &acc.instance_id,
+                            &acc.credential,
                             ProviderCredential {
                                 access_token: Some(new_a.clone()),
                                 ..Default::default()
                             },
-                        );
+                        )?;
+                        if updated.is_none() {
+                            bail!("Cursor credentials changed during refresh. Try again.");
+                        }
                     }
                     access = Some(new_a);
                 }
@@ -959,8 +960,7 @@ mod auth_selection_tests {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdXRoMHx1c2VyX3dvcmsiLCJleHAiOjk5OTk5OTk5OTl9.sig";
         let account = CursorExportAccount {
             instance_id: "cursor:work".to_string(),
-            access_token: Some(jwt.to_string()),
-            refresh_token: None,
+            credential: ProviderCredential { access_token: Some(jwt.to_string()), ..Default::default() },
             store_path: None,
         };
         let resolved = resolve_cursor_access_token("cursor", None, Some(&account))
@@ -972,8 +972,7 @@ mod auth_selection_tests {
     fn multi_account_without_tokens_does_not_leak_default_auth() {
         let empty = CursorExportAccount {
             instance_id: "cursor:empty".to_string(),
-            access_token: None,
-            refresh_token: None,
+            credential: ProviderCredential::default(),
             store_path: None,
         };
         let err = resolve_cursor_access_token("cursor", None, Some(&empty)).unwrap_err();

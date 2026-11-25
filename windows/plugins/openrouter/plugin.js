@@ -67,10 +67,10 @@
   }
 
   function loadApiKey(ctx) {
-    const providerKey = ctx.util.providerApiKey && ctx.util.providerApiKey()
+    const providerKey = ctx.util.providerApiKey && ctx.util.providerApiKey();
     if (providerKey) {
-      ctx.host.log.info("api key loaded from provider account")
-      return providerKey
+      ctx.host.log.info("api key loaded from provider account");
+      return providerKey;
     }
     return loadApiKeyFromConfig(ctx) || loadApiKeyFromEnv(ctx);
   }
@@ -97,9 +97,10 @@
 
   function creditsLines(ctx, data) {
     const totalUsage = readNumber(data.total_usage);
-    if (totalUsage === null) return [];
+    const reportedCredits = readNumber(data.total_credits);
+    if (totalUsage === null || reportedCredits === null) return [];
     const used = Math.max(0, totalUsage);
-    const totalCredits = Math.max(0, readNumber(data.total_credits) || 0);
+    const totalCredits = Math.max(0, reportedCredits);
     const lines = [];
     if (totalCredits > 0) {
       lines.push(
@@ -137,12 +138,15 @@
     appendSpend(ctx, data.usage_weekly, "This Week", lines);
     appendSpend(ctx, data.usage_monthly, "This Month", lines);
     const limit = readNumber(data.limit);
-    if (limit !== null && limit > 0) {
-      const remaining = Math.max(0, readNumber(data.limit_remaining) || 0);
+    const remaining = readNumber(data.limit_remaining);
+    if (limit !== null && limit > 0 && remaining === null) {
+      ctx.host.log.warn("key limit reported without a remaining amount; the Key Limit meter is hidden");
+    }
+    if (limit !== null && limit > 0 && remaining !== null) {
       lines.push(
         ctx.line.progress({
           label: "Key Limit",
-          used: Math.max(0, limit - remaining),
+          used: Math.max(0, limit - Math.max(0, remaining)),
           limit: limit,
           format: { kind: "dollars" },
         }),

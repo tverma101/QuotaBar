@@ -1,32 +1,7 @@
 const { spawnSync } = require("node:child_process");
-const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-
-function ensureDevCliSidecar() {
-  const rustc = spawnSync("rustc", ["-vV"], { encoding: "utf8" });
-  if (rustc.error || rustc.status !== 0 || !rustc.stdout) return;
-  const hostMatch = rustc.stdout.match(/^host:\s*(\S+)/m);
-  if (!hostMatch) return;
-  const triple = process.env.TAURI_ENV_TARGET_TRIPLE || process.env.CARGO_BUILD_TARGET || hostMatch[1];
-  const isWin = triple.includes("windows");
-  const binDir = path.join(root, "src-tauri", "binaries");
-  const dest = path.join(binDir, `quotabar-cli-${triple}${isWin ? ".exe" : ""}`);
-  if (fs.existsSync(dest)) return;
-
-  fs.mkdirSync(binDir, { recursive: true });
-  if (!isWin) {
-    fs.writeFileSync(
-      dest,
-      "#!/usr/bin/env sh\nexec cargo run -q -p quotabar-cli -- \"$@\"\n",
-      { mode: 0o755 },
-    );
-    return;
-  }
-  // On Windows, Tauri resource validation only requires the file to exist during dev.
-  fs.writeFileSync(dest, "");
-}
 
 const DEV_PORT = Number.parseInt(process.env.QUOTABAR_VITE_PORT ?? "1420", 10);
 
@@ -147,9 +122,8 @@ function run(command, args) {
   }
 }
 
-run("bun", ["copy-bundled.cjs"]);
-ensureDevCliSidecar();
-
 exitIfDevListenPortBusy(DEV_PORT);
 
+run("bun", ["copy-bundled.cjs"]);
+run("node", ["scripts/prepare-cli-sidecar.cjs", "--dev"]);
 run("bun", ["x", "vite", "--host", "127.0.0.1", "--port", String(DEV_PORT), "--strictPort"]);

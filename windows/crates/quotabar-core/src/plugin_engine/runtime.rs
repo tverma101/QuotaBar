@@ -3,7 +3,10 @@ use crate::plugin_engine::manifest::LoadedPlugin;
 use crate::provider_accounts::{self, ProviderAccountContext};
 use rquickjs::{Array, Context, Ctx, Error, Object, Promise, Runtime, Value};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PROBE_TIMEOUT_SECS: u64 = 30;
@@ -116,7 +119,77 @@ pub fn run_probe_with_history(
         account,
         Duration::from_secs(PROBE_TIMEOUT_SECS),
         refresh_history,
+        None,
+        None,
     )
+}
+
+pub fn run_probe_in_batch(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: Option<ProviderAccountContext>,
+    opencode_go_batch: Option<Arc<host_api::OpenCodeGoProbeBatch>>,
+) -> PluginOutput {
+    run_probe_with_account_timeout(
+        plugin,
+        app_data_dir,
+        app_version,
+        account,
+        Duration::from_secs(PROBE_TIMEOUT_SECS),
+        false,
+        None,
+        opencode_go_batch,
+    )
+}
+
+pub fn run_probe_with_deferred_usage(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: ProviderAccountContext,
+) -> (PluginOutput, Vec<String>) {
+    run_probe_with_deferred_usage_and_history(plugin, app_data_dir, app_version, account, false)
+}
+
+pub fn run_probe_with_deferred_usage_and_history(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: ProviderAccountContext,
+    refresh_history: bool,
+) -> (PluginOutput, Vec<String>) {
+    run_probe_with_deferred_usage_history_and_batch(
+        plugin,
+        app_data_dir,
+        app_version,
+        account,
+        refresh_history,
+        None,
+    )
+}
+
+pub fn run_probe_with_deferred_usage_history_and_batch(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: ProviderAccountContext,
+    refresh_history: bool,
+    opencode_go_batch: Option<Arc<host_api::OpenCodeGoProbeBatch>>,
+) -> (PluginOutput, Vec<String>) {
+    let usage = Rc::new(RefCell::new(Vec::new()));
+    let output = run_probe_with_account_timeout(
+        plugin,
+        app_data_dir,
+        app_version,
+        Some(account),
+        Duration::from_secs(PROBE_TIMEOUT_SECS),
+        refresh_history,
+        Some(Rc::clone(&usage)),
+        opencode_go_batch,
+    );
+    let payloads = usage.take();
+    (output, payloads)
 }
 
 fn run_probe_with_account_timeout(
@@ -126,6 +199,8 @@ fn run_probe_with_account_timeout(
     account: Option<ProviderAccountContext>,
     timeout: Duration,
     refresh_history: bool,
+    deferred_usage: Option<host_api::DeferredUsage>,
+    opencode_go_batch: Option<Arc<host_api::OpenCodeGoProbeBatch>>,
 ) -> PluginOutput {
     let plugin_id = account
         .as_ref()
@@ -136,10 +211,12 @@ fn run_probe_with_account_timeout(
             let Some(account) = &account else { return true };
             let Some(path) = &account.store_path else { return true };
             provider_accounts::load_store_path(path).is_ok_and(|store| {
-                let current = store.accounts.get(&plugin_id)
+                let stored = store.accounts.get(&plugin_id);
+                let current = stored
                     .map(|entry| &entry.credential)
                     .filter(|credential| !credential.is_empty());
                 current == account.credential.as_ref()
+                    && stored.and_then(|entry| entry.codex_home.as_ref()) == account.codex_home.as_ref()
             })
         })
     } else {
@@ -184,7 +261,7 @@ fn run_probe_with_account_timeout(
             account.as_ref(),
             &app_data,
             app_version,
-            deadline,
+            host_api::ProbeNetwork { deadline, opencode_go_batch, deferred_usage },
         )
         .is_err()
         {
@@ -373,6 +450,18 @@ pub fn run_plugin_action(
     args_json: &str,
     account: Option<ProviderAccountContext>,
 ) -> Result<String, String> {
+    run_guarded_plugin_action(plugin, app_data_dir, app_version, action, args_json, account, || true)
+}
+
+pub fn run_guarded_plugin_action(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    action: &str,
+    args_json: &str,
+    account: Option<ProviderAccountContext>,
+    can_redeem: impl Fn() -> bool + 'static,
+) -> Result<String, String> {
     let timeout = Duration::from_secs(PROBE_TIMEOUT_SECS);
     let deadline_at = Instant::now()
         .checked_add(timeout)
@@ -404,7 +493,7 @@ pub fn run_plugin_action(
             account.as_ref(),
             &app_data,
             app_version,
-            deadline,
+            host_api::ProbeNetwork { deadline, opencode_go_batch: None, deferred_usage: None },
         )
         .map_err(|_| "host api injection failed".to_string())?;
         host_api::patch_http_wrapper(&ctx).map_err(|_| "http wrapper failed".to_string())?;
@@ -433,9 +522,11 @@ pub fn run_plugin_action(
         let args_value: Value = globals
             .get("__openusage_action_args")
             .map_err(|_| "missing action args".to_string())?;
+        let consent = rquickjs::Function::new(ctx.clone(), can_redeem)
+            .map_err(|_| "action consent guard failed".to_string())?;
 
         let result_value: Value = action_fn
-            .call((probe_ctx, args_value))
+            .call((probe_ctx, args_value, consent))
             .map_err(|_| extract_error_string(&ctx))?;
 
         let as_outcome = |value: Value| -> Result<String, String> {
@@ -1131,8 +1222,66 @@ mod tests {
                 session_key: None,
                 expires_at: None,
             }),
+            codex_home: None,
             store_path: None,
         }
+    }
+
+    #[test]
+    fn groups_local_and_configured_opencode_credentials_within_a_batch() {
+        let script = format!(
+            "{}\nconst probe = globalThis.__openusage_plugin.probe;\n{}",
+            include_str!("../../../../plugins/opencode-go/plugin.js"),
+            r#"
+            globalThis.__openusage_plugin.probe = function (ctx) {
+                ctx.host.env.get = () => null;
+                ctx.host.fs.exists = path => path.endsWith("/auth.json");
+                ctx.host.fs.readText = () => '{"opencode-go":{"key":"same-test-key"}}';
+                ctx.host.opencodeGateway = undefined;
+                return probe(ctx);
+            };
+            "#,
+        );
+        let plugin = test_plugin_with_id("opencode-go", "OpenCode Go", &script);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let batch = Arc::new(host_api::OpenCodeGoProbeBatch::default());
+        let response = |percent| serde_json::json!({
+            "usage": {
+                "rolling": { "percent": percent },
+                "weekly": { "percent": 0 },
+                "monthly": { "percent": 0 }
+            }
+        }).to_string();
+        let first = response(12);
+        let other = response(34);
+        let fresh = response(56);
+        host_api::install_http_mock(vec![(200, &first), (200, &other), (200, &fresh)]);
+        let run = |context, batch| run_probe_in_batch(&plugin, &dir, "0.0.0", context, Some(batch));
+        let local = run(None, Arc::clone(&batch));
+        let alias = run(
+            Some(account("opencode-go:work", "opencode-go", "Work", "same-test-key")),
+            Arc::clone(&batch),
+        );
+        let second_alias = run(
+            Some(account("opencode-go:copy", "opencode-go", "Copy", "same-test-key")),
+            Arc::clone(&batch),
+        );
+        let distinct = run(
+            Some(account("opencode-go:personal", "opencode-go", "Personal", "other-test-key")),
+            batch,
+        );
+        let next = run(None, Arc::new(host_api::OpenCodeGoProbeBatch::default()));
+        let used = |out: PluginOutput| match out.lines.first() {
+            Some(MetricLine::Progress { used, .. }) => *used,
+            other => panic!("expected OpenCode meter, got {other:?}"),
+        };
+        assert_eq!(alias.provider_id, "opencode-go:work");
+        assert_eq!(
+            [used(local), used(alias), used(second_alias), used(distinct), used(next)],
+            [12.0, 12.0, 12.0, 34.0, 56.0]
+        );
+        assert_eq!(host_api::take_http_mock_requests().len(), 3);
     }
 
     #[test]
@@ -1148,6 +1297,37 @@ mod tests {
         );
         let output = run_probe(&plugin, &temp_app_dir("sync"), "0.0.0");
         assert_eq!(error_text(output), "boom");
+    }
+
+    #[test]
+    fn deferred_probe_collects_daily_rows_without_writing_history() {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    ctx.host.usageDaily.ingest({daily: [{date: "2030-01-01", totalTokens: 42}]});
+                    return {lines: [{type: "text", label: "State", value: "OK"}]};
+                }
+            };
+            "#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let app_data = dir.path().to_path_buf();
+        std::fs::write(app_data.join("settings.json"), r#"{"persistUsageHistory":true}"#).unwrap();
+        let account = ProviderAccountContext {
+            instance_id: "test:work".into(),
+            base_provider_id: "test".into(),
+            label: "Work".into(),
+            credential: None,
+            codex_home: None,
+            store_path: None,
+        };
+        let (output, payloads) = run_probe_with_deferred_usage(&plugin, &app_data, "0.0.0", account);
+        assert_eq!(output.provider_id, "test:work");
+        assert_eq!(payloads.len(), 1);
+        let usage: JsonValue = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(usage["daily"][0]["totalTokens"], 42);
+        assert!(!crate::usage_history::usage_history_db_path(&app_data).exists());
     }
 
     #[test]
@@ -1340,4 +1520,197 @@ mod tests {
             Some("WorkosCursorSessionToken=test-session")
         );
     }
+
+    fn isolated_bundled_plugin(plugin: &LoadedPlugin) -> LoadedPlugin {
+        let mut isolated = plugin.clone();
+        isolated.entry_script = format!(
+            "{}\n;globalThis.__openusage_plugin = (() => {{
+                const plugin = globalThis.__openusage_plugin;
+                const probe = plugin.probe;
+                plugin.probe = function(ctx) {{
+                    if (ctx.host.env) ctx.host.env.get = () => null;
+                    if (ctx.host.fs) {{
+                        ctx.host.fs.homeDir = \"C:/quotabar-isolated-home\";
+                        ctx.host.fs.exists = () => false;
+                        ctx.host.fs.firstExisting = () => null;
+                        ctx.host.fs.firstExistingAppSupport = () => null;
+                        ctx.host.fs.readText = () => null;
+                        ctx.host.fs.writeText = () => false;
+                        ctx.host.fs.listDir = () => [];
+                    }}
+                    const emptyDaily = () => ({{ status: \"no_data\", data: {{ daily: [] }} }});
+                    for (const name of [\"claudeLogs\", \"codexLogs\", \"cursorLogs\", \"grokLogs\", \"antigravityLogs\"]) {{
+                        if (ctx.host[name]) ctx.host[name].queryDaily = emptyDaily;
+                    }}
+                    if (ctx.host.cursorPaths) ctx.host.cursorPaths.resolveStateDb = () => null;
+                    if (ctx.host.cursorUsageExport) {{
+                        ctx.host.cursorUsageExport.queryDaily = () => null;
+                        ctx.host.cursorUsageExport.queryMtd = () => null;
+                    }}
+                    if (ctx.host.sqlite) {{
+                        ctx.host.sqlite.query = () => \"[]\";
+                        ctx.host.sqlite.exec = () => undefined;
+                    }}
+                    if (ctx.host.keychain) {{
+                        for (const key of Object.keys(ctx.host.keychain)) {{
+                            if (key.startsWith(\"read\")) ctx.host.keychain[key] = () => null;
+                            else ctx.host.keychain[key] = () => true;
+                        }}
+                    }}
+                    if (ctx.host.chromiumCookies) ctx.host.chromiumCookies.read = () => [];
+                    if (ctx.host.ls) ctx.host.ls.discover = () => null;
+                    if (ctx.host.opencodeGateway) ctx.host.opencodeGateway.scan = () => null;
+                    if (ctx.host.zcode) ctx.host.zcode.scan = () => null;
+                    return probe(ctx);
+                }};
+                return plugin;
+            }})();",
+            plugin.entry_script
+        );
+        isolated
+    }
+
+    #[test]
+    fn bundled_provider_scripts_execute_fail_closed_in_quickjs_without_machine_state() {
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let plugins = crate::plugin_engine::manifest::load_plugins_from_dir(&plugin_dir);
+        assert!(plugins.len() >= 30, "expected bundled provider inventory, got {}", plugins.len());
+        host_api::install_http_mock(vec![(200, "{}"); 400]);
+        let dir = temp_app_dir("bundled-provider-smoke");
+        let mut failures = Vec::new();
+        for plugin in plugins {
+            let id = plugin.manifest.id.clone();
+            let output = run_probe(&isolated_bundled_plugin(&plugin), &dir, "test");
+            if output.provider_id != id {
+                failures.push(format!("{id}: provider id became {}", output.provider_id));
+            }
+            if output.lines.is_empty() {
+                failures.push(format!("{id}: no metric lines or error badge"));
+            }
+            if matches!(output.lines.first(), Some(MetricLine::Badge { text, .. }) if text == "runtime error") {
+                failures.push(format!("{id}: generic runtime error"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    fn bundled_plugin(plugin_dir: &std::path::Path, id: &str) -> LoadedPlugin {
+        crate::plugin_engine::manifest::load_plugins_from_dir(plugin_dir)
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == id)
+            .unwrap_or_else(|| panic!("bundled {id} plugin"))
+    }
+
+    #[test]
+    fn real_remote_plugins_map_mocked_success_responses_in_quickjs() {
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let dir = temp_app_dir("remote-provider-mocks");
+
+        let openrouter = bundled_plugin(&plugin_dir, "openrouter");
+        host_api::install_http_mock(vec![
+            (200, r#"{"data":{"total_usage":4.5,"total_credits":10}}"#),
+            (200, r#"{"data":{"is_free_tier":false,"usage_daily":1.25,"usage_weekly":3.5,"usage_monthly":8,"limit":20,"limit_remaining":15}}"#),
+        ]);
+        let output = run_probe_with_account(
+            &isolated_bundled_plugin(&openrouter),
+            &dir,
+            "test",
+            Some(account("openrouter:work", "openrouter", "Work", "sk-or-test")),
+        );
+        assert_eq!(output.plan.as_deref(), Some("Pay as you go"));
+        for expected in ["Credits", "Balance", "Today", "Key Limit"] {
+            assert!(output.lines.iter().any(|line| match line {
+                MetricLine::Text { label, .. } | MetricLine::Progress { label, .. } | MetricLine::Badge { label, .. } => label == expected,
+                _ => false,
+            }), "missing OpenRouter line {expected}: {:?}", output.lines);
+        }
+        assert!(!output.lines.iter().any(|line| matches!(line, MetricLine::Badge { label, .. } if label == "Error")));
+        let requests = host_api::take_http_mock_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.headers.get("Authorization").is_some_and(|value| value == "Bearer sk-or-test")));
+
+        let crofai = bundled_plugin(&plugin_dir, "crofai");
+        host_api::install_http_mock(vec![(200, r#"{"credits":10,"usable_requests":100,"requests_plan":500}"#)]);
+        let output = run_probe_with_account(
+            &isolated_bundled_plugin(&crofai),
+            &dir,
+            "test",
+            Some(account("crofai:work", "crofai", "Work", "crof-test")),
+        );
+        assert!(!output.lines.is_empty());
+        assert!(!output.lines.iter().any(|line| matches!(line, MetricLine::Badge { label, .. } if label == "Error")), "unexpected CrofAI error: {:?}", output.lines);
+        let requests = host_api::take_http_mock_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers.get("Authorization").map(String::as_str), Some("Bearer crof-test"));
+    }
+
+    #[test]
+    fn real_cursor_plugin_dev_mock_accounts_probe_successfully_without_network() {
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let plugin = crate::plugin_engine::manifest::load_plugins_from_dir(&plugin_dir)
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == "cursor")
+            .expect("bundled Cursor plugin");
+        let dir = temp_app_dir("cursor-dev-mock-accounts");
+        for (instance, label) in [("cursor:work", "Work"), ("cursor:personal", "Personal")] {
+            let output = run_probe_with_account(
+                &isolated_bundled_plugin(&plugin),
+                &dir,
+                "test",
+                Some(account(instance, "cursor", label, "quotabar-dev-mock-access-token")),
+            );
+            assert_eq!(output.provider_id, instance);
+            assert_eq!(output.plan.as_deref(), Some("Dev mock"));
+            assert!(output.lines.iter().any(|line| matches!(
+                line,
+                MetricLine::Text { label, value, .. } if label == "Data source" && value == "Mock (QuotaBar dev)"
+            )));
+            assert!(!output.lines.iter().any(|line| matches!(line, MetricLine::Badge { label, .. } if label == "Error")));
+        }
+    }
+
+    #[test]
+    fn concurrent_quickjs_probes_survive_repeated_parallel_stress() {
+        let script = r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    let total = 0;
+                    for (let i = 0; i < 2000; i += 1) total += i % 7;
+                    ctx.host.usageDaily.ingest({ daily: [{ date: "2030-01-01", totalTokens: total }] });
+                    return { lines: [{ type: "text", label: "State", value: "ok" }] };
+                }
+            };
+        "#;
+        let mut failures = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for worker in 0..8 {
+                handles.push(scope.spawn(move || {
+                    let plugin = test_plugin_with_id("stress", "Stress", script);
+                    let dir = temp_app_dir(&format!("parallel-probe-{worker}"));
+                    for iteration in 0..10 {
+                        let (output, payloads) = run_probe_with_deferred_usage(
+                            &plugin,
+                            &dir,
+                            "test",
+                            account("stress:worker", "stress", "Worker", "token"),
+                        );
+                        if output.provider_id != "stress:worker" || payloads.len() != 1 {
+                            return Err(format!("worker {worker} iteration {iteration} produced invalid output"));
+                        }
+                    }
+                    Ok::<(), String>(())
+                }));
+            }
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => failures.push(error),
+                    Err(_) => failures.push("worker panicked".to_string()),
+                }
+            }
+        });
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
 }

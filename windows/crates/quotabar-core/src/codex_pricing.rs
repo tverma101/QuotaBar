@@ -2,6 +2,7 @@
 
 use crate::log_usage_types::TokenBreakdown;
 use crate::model_pricing::{ModelPricing, ModelRates};
+use chrono::{DateTime, Utc};
 
 pub struct CodexCostInput<'a> {
     pub model: &'a str,
@@ -57,7 +58,16 @@ fn codex_long_context_rates(model: &str) -> Option<(f64, f64, f64)> {
 }
 
 /// Non-cached input + explicit cache-read (or full input), output+reasoning, 272k tier, priority mult.
-pub fn estimated_cost_dollars(pricing: &ModelPricing, event: &CodexCostInput<'_>) -> Option<f64> {
+#[cfg(test)]
+fn estimated_cost_dollars(pricing: &ModelPricing, event: &CodexCostInput<'_>) -> Option<f64> {
+    estimated_cost_dollars_at(pricing, event, None)
+}
+
+pub fn estimated_cost_dollars_at(
+    pricing: &ModelPricing,
+    event: &CodexCostInput<'_>,
+    timestamp: Option<DateTime<Utc>>,
+) -> Option<f64> {
     let trimmed = event.model.trim();
     if trimmed.is_empty() {
         return None;
@@ -104,7 +114,7 @@ pub fn estimated_cost_dollars(pricing: &ModelPricing, event: &CodexCostInput<'_>
         output: event.output + event.reasoning,
         is_fast: applies_codex_fast,
     };
-    Some(rates.cost_dollars(&tokens))
+    Some(rates.cost_dollars_at(&tokens, timestamp, true))
 }
 
 #[cfg(test)]

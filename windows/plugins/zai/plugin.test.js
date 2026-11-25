@@ -6,6 +6,25 @@ const loadPlugin = async () => {
   return globalThis.__openusage_plugin
 }
 
+it("shows local ZCode history and an active grant without requesting a remote quota", async () => {
+  const ctx = makeCtx()
+  ctx.nowIso = new Date(2026, 1, 2, 12).toISOString()
+  ctx.host.zcode = { scan: () => JSON.stringify({
+    daily: [{ date: "2026-02-02", totalTokens: 30, totalCost: null }],
+    entitlement: { quota: { level: "Start", limits: [
+      { planId: "wk-current", period: "one_time", unit: 500, usage: 80, remaining: 420,
+        nextResetTime: Date.parse(ctx.nowIso) + 60_000 },
+      { planId: "wk-expired", period: "one_time", unit: 600, usage: 90, remaining: 510,
+        nextResetTime: Date.parse(ctx.nowIso) - 60_000 },
+    ] } },
+  }) }
+  const { plan, lines } = (await loadPlugin()).probe(ctx)
+  expect(plan).toBe("Start Plan")
+  expect(lines.find(line => line.label === "Weekend Build")).toMatchObject({ used: 80, limit: 500 })
+  expect(lines.find(line => line.label === "Today")).toMatchObject({ value: "30 tokens" })
+  expect(ctx.host.http.request).not.toHaveBeenCalled()
+})
+
 const mockEnvWithKey = (ctx, key, varName = "ZAI_API_KEY") => {
   ctx.host.env.get.mockImplementation((name) => (name === varName ? key : null))
 }
@@ -303,6 +322,7 @@ describe("zai plugin", () => {
 
   it("passes resetsAt from nextResetTime (epoch ms to ISO)", async () => {
     const ctx = makeCtx()
+    ctx.nowIso = "2025-01-01T00:00:00Z"
     mockEnvWithKey(ctx, "test-key")
     mockHttp(ctx)
 
@@ -312,7 +332,7 @@ describe("zai plugin", () => {
     expect(line.resetsAt).toBe(new Date(1738368000000).toISOString())
   })
 
-  it("renders Web Searches line with count format and 1st-of-month reset", async () => {
+  it("renders Web Searches line with count format and monthly cadence", async () => {
     const ctx = makeCtx()
     mockEnvWithKey(ctx, "test-key")
     mockHttp(ctx)
@@ -324,11 +344,9 @@ describe("zai plugin", () => {
     expect(line.type).toBe("progress")
     expect(line.used).toBe(1095)
     expect(line.limit).toBe(4000)
-    expect(line.format).toEqual({ kind: "count", suffix: "/ 4000" })
+    expect(line.format).toEqual({ kind: "count", suffix: "searches" })
     expect(line.periodDurationMs).toBe(30 * 24 * 60 * 60 * 1000)
-    const now = new Date()
-    const expected1st = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
-    expect(line.resetsAt).toBe(expected1st.toISOString())
+    expect(line.resetsAt).toBeUndefined()
   })
 
   it("skips Web Searches when TIME_LIMIT is absent", async () => {
@@ -347,7 +365,7 @@ describe("zai plugin", () => {
     expect(result.lines.find((l) => l.label === "Session")).toBeTruthy()
   })
 
-  it("Web Searches still has resetsAt (1st of month) even when subscription fails", async () => {
+  it("Web Searches still has monthly cadence even when subscription fails", async () => {
     const ctx = makeCtx()
     mockEnvWithKey(ctx, "test-key")
     ctx.host.http.request.mockImplementation((opts) => {
@@ -361,9 +379,8 @@ describe("zai plugin", () => {
     const result = plugin.probe(ctx)
     const line = result.lines.find((l) => l.label === "Web Searches")
     expect(line).toBeTruthy()
-    const now = new Date()
-    const expected1st = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
-    expect(line.resetsAt).toBe(expected1st.toISOString())
+    expect(line.periodDurationMs).toBe(30 * 24 * 60 * 60 * 1000)
+    expect(line.resetsAt).toBeUndefined()
   })
 
   it("handles missing nextResetTime gracefully", async () => {
@@ -536,11 +553,12 @@ describe("zai plugin", () => {
     expect(line.used).toBe(10)
     expect(line.limit).toBe(100)
     expect(line.format).toEqual({ kind: "percent" })
-    expect(line.periodDurationMs).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(line.periodDurationMs).toBe(7 * 7 * 24 * 60 * 60 * 1000)
   })
 
   it("Weekly line has correct percentage, resetsAt, and periodDurationMs values", async () => {
     const ctx = makeCtx()
+    ctx.nowIso = "2025-01-01T00:00:00Z"
     mockEnvWithKey(ctx, "test-key")
     ctx.host.http.request.mockImplementation((opts) => {
       if (opts.url.includes("subscription")) {
@@ -554,11 +572,12 @@ describe("zai plugin", () => {
     const line = result.lines.find((l) => l.label === "Weekly")
     expect(line).toBeTruthy()
     expect(line.resetsAt).toBe(new Date(1738972800000).toISOString())
-    expect(line.periodDurationMs).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(line.periodDurationMs).toBe(7 * 7 * 24 * 60 * 60 * 1000)
   })
 
   it("correctly binds Session to unit 3 and Weekly to unit 6 when weekly appears first", async () => {
     const ctx = makeCtx()
+    ctx.nowIso = "2025-01-01T00:00:00Z"
     mockEnvWithKey(ctx, "test-key")
     const quotaReversed = {
       code: 200,
@@ -641,6 +660,7 @@ describe("zai plugin", () => {
 
   it("prefers TOKENS_LIMIT over CREDIT_LIMIT when both types are present", async () => {
     const ctx = makeCtx()
+    ctx.nowIso = "2025-01-01T00:00:00Z"
     mockEnvWithKey(ctx, "test-key")
     ctx.host.http.request.mockImplementation((opts) => {
       if (opts.url.includes("subscription")) {
@@ -676,5 +696,55 @@ describe("zai plugin", () => {
     expect(session.used).toBe(42)
     expect(session.resetsAt).toBe(new Date(1738368000000).toISOString())
   })
-})
 
+  it("uses the selected account key, then config, then environment", async () => {
+    const ctx = makeCtx()
+    mockEnvWithKey(ctx, "environment-key")
+    ctx.host.fs.writeText("~/.config/openusage/zai.json", JSON.stringify({ api_key: "config-key" }))
+    ctx.util.providerApiKey = vi.fn().mockReturnValueOnce("account-key")
+    mockHttp(ctx)
+    const plugin = await loadPlugin()
+    plugin.probe(ctx)
+    plugin.probe(ctx)
+    expect(ctx.host.http.request.mock.calls.map(([req]) => req.headers.Authorization)).toEqual([
+      "Bearer account-key", "Bearer account-key", "Bearer config-key", "Bearer config-key",
+    ])
+  })
+
+  it("keeps a valid window beside malformed entries and drops stale resets and zero allowances", async () => {
+    const ctx = makeCtx()
+    mockEnvWithKey(ctx, "test-key")
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({ limits: [
+        { type: "CREDIT_LIMIT", unit: 3, number: 5 },
+        { name: "CREDIT_LIMIT", unit: "4", number: "7", percentage: 20, nextResetTime: 1 },
+        { type: "TIME_LIMIT", currentValue: 0, usage: 0 },
+      ] }),
+    })
+    const plugin = await loadPlugin()
+    const { lines } = plugin.probe(ctx)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({ label: "Weekly", used: 20, periodDurationMs: 604800000 })
+    expect(lines[0].resetsAt).toBeUndefined()
+  })
+
+  it("reports that a valid key has no Coding Plan without exposing a subscription label", async () => {
+    const ctx = makeCtx()
+    mockEnvWithKey(ctx, "test-key")
+    ctx.host.http.request.mockImplementation(({ url }) => ({
+      status: 200,
+      bodyText: JSON.stringify(url.includes("subscription")
+        ? SUBSCRIPTION_RESPONSE
+        : { success: false, msg: "No Coding Plan" }),
+    }))
+    const plugin = await loadPlugin()
+    expect(plugin.probe(ctx)).toMatchObject({
+      plan: null,
+      lines: [expect.objectContaining({ type: "badge", text: "No usage data" })],
+      warning: expect.stringContaining("No active GLM Coding Plan"),
+    })
+    expect(ctx.host.http.request).toHaveBeenCalledTimes(1)
+  })
+
+})

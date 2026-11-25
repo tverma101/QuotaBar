@@ -241,6 +241,22 @@ describe("antigravity plugin", () => {
     expect(() => plugin.probe(ctx)).toThrow(LOGIN_MESSAGE)
   })
 
+  it("never uses the signed-in IDE for a separately configured account", async () => {
+    const ctx = makeCtx()
+    ctx.account = { instanceId: "antigravity:work", baseProviderId: "antigravity" }
+    ctx.host.ls.discover.mockReturnValue(makeDiscovery())
+    ctx.util.readProviderCredential = () => ({ accessToken: "isolated-fixture-token" })
+    ctx.host.http.request.mockReturnValue({ status: 401, bodyText: "{}" })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow(LOGIN_MESSAGE)
+    expect(ctx.host.ls.discover).not.toHaveBeenCalled()
+    expect(ctx.host.http.request).toHaveBeenCalled()
+    expect(ctx.host.http.request.mock.calls.every(([request]) =>
+      !String(request.url).includes("127.0.0.1"),
+    )).toBe(true)
+  })
+
   it("throws when no working port found and no DB credentials", async () => {
     const ctx = makeCtx()
     ctx.host.ls.discover.mockReturnValue(makeDiscovery())

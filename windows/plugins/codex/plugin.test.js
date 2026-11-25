@@ -18,6 +18,34 @@ describe("codex plugin", () => {
     vi.resetModules()
   })
 
+  it("uses only the registered home and stops if its login changes", async () => {
+    const ctx = makeCtx()
+    ctx.account = { instanceId: "codex:work", codexHome: { path: "C:/Work,Codex", accountId: "work" } }
+    const authPath = "C:/Work,Codex/auth.json"
+    const writeAuth = (accountId) => ctx.host.fs.writeText(authPath, JSON.stringify({
+      tokens: { access_token: "home-token", account_id: accountId },
+      last_refresh: new Date().toISOString(),
+    }))
+    writeAuth("work")
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      headers: { "x-codex-primary-used-percent": "12" },
+      bodyText: "{}",
+    })
+    const plugin = await loadPlugin()
+    expect(plugin.probe(ctx).verifiedHistoryIdentity).toBe("work")
+    expect(ctx.host.http.request.mock.calls[0][0].headers.Authorization).toBe("Bearer home-token")
+    expect(ctx.host.codexLogs.queryDaily).toHaveBeenCalledWith(expect.objectContaining({
+      homePath: "C:/Work,Codex",
+      isolatedHome: true,
+    }))
+    writeAuth("another-account")
+    ctx.host.http.request.mockClear()
+    expect(() => plugin.probe(ctx)).toThrow(/Token conflict/)
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
+    expect(ctx.host.keychain.readGenericPassword).not.toHaveBeenCalled()
+  })
+
   const expectStaleFileAuthFallsBackToKeychain = async (refreshResponse) => {
     const ctx = makeCtx()
     ctx.host.fs.writeText("~/.codex/auth.json", JSON.stringify({
@@ -119,6 +147,46 @@ describe("codex plugin", () => {
     expiresAtIso: "2030-01-01T00:00:00Z",
     redeemRequestId: "test-request",
   }
+
+  it("auto-claims only the exact expiring credit after consent, replaying the original request", async () => {
+    const ctx = makeAccountCtx({
+      instanceId: "codex:work",
+      credential: { accessToken: makeJwt({ "https://api.openai.com/auth": { chatgpt_account_id: "work" } }) },
+    })
+    const expiryMs = Date.now() + 30_000
+    const args = { accountId: "work", expiryMs, id: "target", requestId: "original" }
+    const credits = [
+      { id: "other", expires_at: new Date(expiryMs).toISOString() },
+      { id: "target", expires_at: new Date(expiryMs).toISOString() },
+    ]
+    ctx.host.http.request.mockImplementation(({ method }) => ({
+      status: 200,
+      bodyText: JSON.stringify(method === "GET" ? { credits } : { code: "already_redeemed" }),
+    }))
+    const plugin = await loadPlugin()
+    const claim = (overrides, yes = true) => plugin.claimAutomaticReset(ctx, { ...args, ...overrides }, () => yes)
+    const posts = () => ctx.host.http.request.mock.calls.filter(([request]) => request.method === "POST")
+    expect(claim({ expiryMs: expiryMs + 60_000 })).toBe("cancelled")
+    expect(claim({ expiryMs: expiryMs - 60_000 })).toBe("no_credit")
+    expect(claim({ accountId: "default" })).toBe("failed")
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
+    expect(claim({ id: "missing" })).toBe("no_credit")
+    expect(claim({}, false)).toBe("cancelled")
+    expect(posts()).toHaveLength(0)
+    expect(JSON.parse(plugin.listAutomaticResets(ctx, args))).toEqual([
+      { id: "other", expiryMs }, { id: "target", expiryMs },
+    ])
+    expect(claim({})).toBe("success")
+    credits.pop()
+    expect(claim({ retry: true })).toBe("success")
+    expect(posts()).toHaveLength(2)
+    for (const [request] of posts()) {
+      expect(request.headers.Authorization).toBe(`Bearer ${makeJwt({ "https://api.openai.com/auth": { chatgpt_account_id: "work" } })}`)
+      expect(request.headers["ChatGPT-Account-Id"]).toBe("work")
+      expect(JSON.parse(request.bodyText)).toEqual({ credit_id: "target", redeem_request_id: "original" })
+    }
+    expect(ctx.host.keychain.readGenericPassword).not.toHaveBeenCalled()
+  })
 
   it("does not request or consume an already expired reset credit", async () => {
     const ctx = makeAccountCtx({ instanceId: "codex:work", credential: { accessToken: "work-token" } })

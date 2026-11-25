@@ -29,7 +29,6 @@ describe("OverviewPage", () => {
     render(
       <OverviewPage
         plugins={[]}
-        pluginSettings={null}
         displayMode="used"
         resetTimerDisplayMode="relative"
       />
@@ -51,12 +50,12 @@ describe("OverviewPage", () => {
     render(
       <OverviewPage
         plugins={plugins}
-        pluginSettings={null}
         displayMode="used"
         resetTimerDisplayMode="relative"
       />
     )
     expect(screen.getByText("Alpha")).toBeInTheDocument()
+    expect(screen.queryByText(/enable usage history for weekly totals/i)).not.toBeInTheDocument()
   })
 
   it("only shows overview-scoped lines", () => {
@@ -89,7 +88,6 @@ describe("OverviewPage", () => {
     render(
       <OverviewPage
         plugins={plugins}
-        pluginSettings={null}
         displayMode="used"
         resetTimerDisplayMode="relative"
       />
@@ -121,7 +119,6 @@ describe("OverviewPage", () => {
     render(
       <OverviewPage
         plugins={plugins}
-        pluginSettings={null}
         displayMode="used"
         resetTimerDisplayMode="relative"
       />

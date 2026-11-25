@@ -138,7 +138,7 @@ fn derive_key(password: &[u8], iterations: u32) -> DerivedKey {
 }
 
 fn safe_storage_passwords() -> Vec<String> {
-    let mut out = Vec::new();
+    let out = Vec::new();
     #[cfg(target_os = "linux")]
     {
         for application in [

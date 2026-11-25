@@ -9,6 +9,7 @@ mod daemon;
 mod embedded_plugins;
 mod history;
 mod panic_hook;
+mod read;
 mod reset_display;
 mod tui;
 
@@ -101,6 +102,17 @@ enum Commands {
     Limits {
         /// Plugin ids (e.g. cursor, claude). If empty, probes all.
         plugin_ids: Vec<String>,
+    },
+    /// Read enabled provider limits from fresh tray snapshots, or refresh stale data
+    Read {
+        /// Exact provider instance ID or provider family
+        provider: Option<String>,
+        /// Refresh even if the cached snapshot is fresh
+        #[arg(long)]
+        force: bool,
+        /// Include normalized snapshots, freshness, warnings and errors
+        #[arg(long)]
+        diagnose: bool,
     },
     /// Full-screen btop-style dashboard (default if no subcommand)
     #[command(visible_alias = "tui")]
@@ -206,6 +218,21 @@ fn sort_list_rows_by_id(rows: &mut Vec<ListUsageRow>) {
             );
         }
 
+        if let Some(Commands::Read { provider, force, diagnose }) = &cli.command {
+            apply_cli_log_policy(cli.verbose);
+            let code = match read::run(provider.as_deref(), *force, *diagnose) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("quotabar-cli: {err:#}");
+                    4
+                }
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+
         if let Some(Commands::UsageStats {
             ref provider,
             ref since,
@@ -273,8 +300,8 @@ fn sort_list_rows_by_id(rows: &mut Vec<ListUsageRow>) {
                     &resource_resolution,
                 )?;
             }
-            Some(Commands::UsageStats { .. }) => {
-                unreachable!("usage-stats is handled before plugin load")
+            Some(Commands::Read { .. } | Commands::UsageStats { .. }) => {
+                unreachable!("handled before plugin load")
             }
             Some(Commands::Dashboard { ref plugin_ids }) => {
                 run_dashboard_cmd(
