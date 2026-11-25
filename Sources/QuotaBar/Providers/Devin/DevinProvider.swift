@@ -19,16 +19,22 @@ final class DevinProvider: ProviderRuntime {
 
     let authStore: DevinAuthStore
     let usageClient: DevinUsageClient
+    let transcriptUsageScanner: DevinTranscriptUsageScanner
     let now: @Sendable () -> Date
+    let pricing: @Sendable () async -> ModelPricing
 
     init(
         authStore: DevinAuthStore = DevinAuthStore(),
         usageClient: DevinUsageClient = DevinUsageClient(),
-        now: @escaping @Sendable () -> Date = Date.init
+        transcriptUsageScanner: DevinTranscriptUsageScanner = DevinTranscriptUsageScanner(),
+        now: @escaping @Sendable () -> Date = Date.init,
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
+        self.transcriptUsageScanner = transcriptUsageScanner
         self.now = now
+        self.pricing = pricing
     }
 
     var widgetDescriptors: [WidgetDescriptor] {
@@ -39,8 +45,15 @@ final class DevinProvider: ProviderRuntime {
             .percent(id: "devin.weekly", provider: provider, title: "Weekly", metricLabel: "Weekly quota")
                 .exportingLimit("weekly", unit: "percent"),
             .dollarBalance(id: "devin.extra", provider: provider, title: "Extra Balance", metricLabel: "Extra usage balance", valueWord: "left").hidingWhenEmpty()
-                .exportingLimit("extraUsageBalance", kind: .balance, unit: "usd", source: .value(kind: .dollars))
-        ]
+                .exportingLimit("extraUsageBalance", kind: .balance, unit: "usd", source: .value(kind: .dollars)),
+            .usageTrend(provider: provider)
+                .exportingHistory(
+                    scope: .machineLocal,
+                    estimatedCost: true,
+                    sourceNote: "From local Devin sessions; dollar amounts are estimates"
+                )
+            // Local spend tiles from the CLI's local session usage.
+        ] + WidgetDescriptor.spendTiles(provider: provider)
     }
 
     func hasLocalCredentials() async -> Bool {
@@ -60,6 +73,13 @@ final class DevinProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
+        // Fold-only passes (panel phase 2, local-accounting wakes) recompute the local usage
+        // history without re-reading the live quota API — the store's merge recovers the meters
+        // and plan from the prior snapshot.
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            return await localUsageSnapshot()
+        }
+
         var sawAPIKey = false
         var sawAuthFailure = false
         var credentialSourceUnreadable = false
@@ -82,7 +102,7 @@ final class DevinProvider: ProviderRuntime {
             sawAPIKey = true
             switch await attempt(auth: credentials) {
             case .success(let mapped):
-                return snapshot(from: mapped)
+                return await snapshot(from: mapped)
             case .authFailure:
                 sawAuthFailure = true
             case .failed(let failure):
@@ -107,7 +127,7 @@ final class DevinProvider: ProviderRuntime {
             sawAPIKey = true
             switch await attempt(auth: appAuth) {
             case .success(let mapped):
-                return snapshot(from: mapped)
+                return await snapshot(from: mapped)
             case .authFailure:
                 sawAuthFailure = true
             case .failed(let failure):
@@ -195,8 +215,68 @@ final class DevinProvider: ProviderRuntime {
             authStore.effectiveAPIServerURL(appAuth) != authStore.effectiveAPIServerURL(credentials)
     }
 
-    private func snapshot(from mapped: DevinMappedUsage) -> ProviderSnapshot {
-        ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines, refreshedAt: now())
+    private func snapshot(from mapped: DevinMappedUsage) async -> ProviderSnapshot {
+        var lines = mapped.lines
+        // Menu-bar and panel-meter passes only need the quota meters. Skip the local usage scan;
+        // the data store merges prior spend/history lines onto this snapshot.
+        let usageHistory = ProviderRefreshContext.scope.skipsLocalAccounting
+            ? nil
+            : await appendLocalUsage(to: &lines, now: now())
+        return ProviderSnapshot.make(
+            provider: provider,
+            plan: mapped.plan,
+            lines: lines,
+            refreshedAt: now(),
+            usageHistory: usageHistory
+        )
+    }
+
+    /// The fold-only snapshot: local spend tiles and Usage Trend without the quota meters,
+    /// which the store recovers from the prior snapshot alongside their freshness stamp.
+    private func localUsageSnapshot() async -> ProviderSnapshot {
+        var lines: [MetricLine] = []
+        let usageHistory = await appendLocalUsage(to: &lines, now: now())
+        MetricLine.appendNoDataIfNeeded(&lines)
+        return ProviderSnapshot.make(
+            provider: provider,
+            plan: nil,
+            lines: lines,
+            refreshedAt: now(),
+            usageHistory: usageHistory
+        )
+    }
+
+    /// Local spend tiles from the CLI's session database, falling back to exported transcripts
+    /// when the database is missing or holds no metered calls. A nil scan means the local usage
+    /// source could not be completely read — the provider keeps its last-good history rather than
+    /// publishing a partial fold. The pricing snapshot resolves inside the scan only when metered
+    /// rows exist, so a fold that finds nothing never pays the catalog decode.
+    private func appendLocalUsage(to lines: inout [MetricLine], now: Date) async -> ProviderUsageHistory? {
+        guard !Task.isCancelled else { return nil }
+        guard let scan = await transcriptUsageScanner.scan(
+            daysBack: UsageHistoryWindow.lifetimeDays(through: now),
+            now: now,
+            pricing: pricing
+        ) else { return nil }
+        let note = "From local Devin sessions; dollar amounts are estimates"
+        SpendTileMapper.appendTokenUsage(
+            scan.series,
+            to: &lines,
+            now: now,
+            unknownModelsByDay: scan.unknownModelsByDay,
+            modelUsage: scan.modelUsage,
+            modelSourceNote: note,
+            apiEstimateByDay: scan.apiEstimateByDay,
+            estimatedCostDays: scan.estimatedCostDays
+        )
+        SpendTileMapper.appendUsageTrend(scan.series, to: &lines, now: now, note: note)
+        return ProviderUsageHistory(
+            series: scan.series,
+            modelUsage: scan.modelUsage,
+            unknownModelsByDay: scan.unknownModelsByDay,
+            apiEstimateByDay: scan.apiEstimateByDay,
+            apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays
+        )
     }
 }
 
