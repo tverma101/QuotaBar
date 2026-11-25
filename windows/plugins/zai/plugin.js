@@ -3,15 +3,36 @@
   const SUBSCRIPTION_URL = BASE_URL + "/api/biz/subscription/list"
   const QUOTA_URL = BASE_URL + "/api/monitor/usage/quota/limit"
   const PERIOD_MS = 5 * 60 * 60 * 1000
+  const DAY_MS = 24 * 60 * 60 * 1000
   const WEEK_MS = 7 * 24 * 60 * 60 * 1000
   const MONTH_MS = 30 * 24 * 60 * 60 * 1000
   const ERR_INVALID_RESPONSE = "Usage response invalid. Try again later."
+  const CONFIG_PATHS = ["~/.config/openusage/zai.json", "~/.config/zai/key.json"]
+
+  function readString(value) {
+    return typeof value === "string" ? value.trim() : ""
+  }
 
   function loadApiKey(ctx) {
     const providerKey = ctx.util.providerApiKey && ctx.util.providerApiKey()
     if (providerKey) {
       ctx.host.log.info("api key loaded from provider account")
       return providerKey
+    }
+    for (const path of CONFIG_PATHS) {
+      try {
+        if (!ctx.host.fs.exists(path)) continue
+        const text = readString(ctx.host.fs.readText(path))
+        if (!text) continue
+        if (!text.startsWith("{")) return text
+        const config = ctx.util.tryParseJson(text)
+        if (config) {
+          const key = readString(config.apiKey) || readString(config.api_key) || readString(config.key)
+          if (key) return key
+        }
+      } catch {
+        ctx.host.log.warn("config read failed for " + path)
+      }
     }
     const zai = ctx.host.env.get("ZAI_API_KEY")
     if (typeof zai === "string" && zai.trim()) return zai.trim()
@@ -104,33 +125,30 @@
     return Math.min(100, Math.max(0, value))
   }
 
-  function findLimit(limits, type, unit) {
-    let fallback = null
-    for (let i = 0; i < limits.length; i++) {
-      const item = limits[i]
-      if (item.type === type || item.name === type) {
-        if (unit === undefined) {
-          return item
-        }
-        if (item.unit === unit) {
-          return item
-        }
-        // Store first entry without unit as fallback
-        if (fallback === null && item.unit === undefined) {
-          fallback = item
-        }
-      }
-    }
-    return fallback
+  function resetIso(ctx, value) {
+    const resetMs = parseNumber(value)
+    const now = ctx.util.parseDateMs(ctx.nowIso) ?? Date.now()
+    if (resetMs === null || resetMs <= now || resetMs - now > 2 * 365 * DAY_MS) return undefined
+    return ctx.util.toIso(resetMs)
+  }
+
+  function windowDuration(entry) {
+    const unit = parseNumber(entry.unit)
+    const count = entry.number === undefined ? 1 : parseNumber(entry.number)
+    const unitMs = { 3: DAY_MS / 24, 4: DAY_MS, 5: MONTH_MS, 6: WEEK_MS }[unit]
+    if (entry.unit === undefined && entry.number === undefined) return PERIOD_MS
+    if (unit === null || count === null || count <= 0) throw ERR_INVALID_RESPONSE
+    if (unitMs === undefined) return null
+    const duration = Math.trunc(unitMs * count)
+    if (!Number.isSafeInteger(duration) || duration < 1) throw ERR_INVALID_RESPONSE
+    return duration
   }
 
   function mapTokenProgress(ctx, entry, label, periodMs) {
     const rawPercentage = parseNumber(entry.percentage)
     if (rawPercentage === null) throw ERR_INVALID_RESPONSE
     const used = clampPercent(rawPercentage)
-    const resetsAt = entry.nextResetTime != null
-      ? (parseNumber(entry.nextResetTime) != null ? ctx.util.toIso(parseNumber(entry.nextResetTime)) : undefined)
-      : undefined
+    const resetsAt = resetIso(ctx, entry.nextResetTime)
 
     const progressOpts = {
       label: label,
@@ -149,21 +167,16 @@
     if (used === null || limit === null || used < 0 || limit < 0) {
       throw ERR_INVALID_RESPONSE
     }
-    const now = new Date()
-    const nextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
-    let webResetsAt = nextMonth.toISOString()
-    if (entry.nextResetTime != null) {
-      const resetMs = parseNumber(entry.nextResetTime)
-      if (resetMs !== null) webResetsAt = ctx.util.toIso(resetMs)
-    }
+    if (limit === 0) return null
+    const resetsAt = resetIso(ctx, entry.nextResetTime)
 
     return ctx.line.progress({
       label: "Web Searches",
       used: used,
       limit: limit,
-      format: { kind: "count", suffix: "/ " + limit },
+      format: { kind: "count", suffix: "searches" },
       periodDurationMs: MONTH_MS,
-      resetsAt: webResetsAt,
+      ...(resetsAt ? { resetsAt } : {}),
     })
   }
 
@@ -185,43 +198,51 @@
 
   function probeQuota(ctx, apiKey) {
 
-    const sub = fetchSubscription(ctx, apiKey)
-    const plan = sub && sub.productName ? ctx.fmt.planLabel(sub.productName) : null
-
     const quota = fetchQuota(ctx, apiKey)
     const lines = []
-    if (quota.success === false && typeof quota.msg === "string" && quota.msg.toLowerCase().includes("coding plan")) {
-      throw "This Z.ai account does not have a Coding Plan."
+    if (quota.success === false && /coding plan/i.test(quota.msg)) {
+      lines.push(ctx.line.badge({ label: "Status", text: "No usage data", color: "#a3a3a3" }))
+      return { plan: null, lines, warning: "No active GLM Coding Plan. Subscribe at z.ai/subscribe to see usage." }
+
     }
 
     const limits = extractLimits(quota)
     if (limits === null) {
       throw ERR_INVALID_RESPONSE
     }
-    if (limits.length === 0) {
-      lines.push(ctx.line.badge({ label: "Status", text: "No usage data", color: "#a3a3a3" }))
-      return { plan, lines }
+    if (limits.some(entry => !entry || typeof entry !== "object" || Array.isArray(entry))) {
+      throw ERR_INVALID_RESPONSE
     }
-
-    const tokenLimit = findLimit(limits, "TOKENS_LIMIT", 3) || findLimit(limits, "CREDIT_LIMIT", 3)
-    if (tokenLimit) {
-      lines.push(mapTokenProgress(ctx, tokenLimit, "Session", PERIOD_MS))
+    let damaged = false
+    const mapped = {}
+    for (const type of ["TOKENS_LIMIT", "CREDIT_LIMIT", "TIME_LIMIT"]) {
+      for (const entry of limits) {
+        if (entry.type !== type && entry.name !== type) continue
+        try {
+          if (type === "TIME_LIMIT") {
+            mapped["Web Searches"] ??= mapWebSearches(ctx, entry)
+          } else {
+            const duration = windowDuration(entry)
+            if (duration === null) continue
+            const label = duration < DAY_MS ? "Session" : "Weekly"
+            mapped[label] ??= mapTokenProgress(ctx, entry, label, duration)
+          }
+        } catch {
+          damaged = true
+          ctx.host.log.warn("skipped unreadable " + type + " quota entry")
+        }
+      }
     }
-
-    const weeklyTokenLimit = findLimit(limits, "TOKENS_LIMIT", 6) || findLimit(limits, "CREDIT_LIMIT", 6)
-    if (weeklyTokenLimit) {
-      lines.push(mapTokenProgress(ctx, weeklyTokenLimit, "Weekly", WEEK_MS))
+    for (const label of ["Session", "Weekly", "Web Searches"]) {
+      if (mapped[label]) lines.push(mapped[label])
     }
-
-    const timeLimit = findLimit(limits, "TIME_LIMIT")
-    if (timeLimit) {
-      lines.push(mapWebSearches(ctx, timeLimit))
-    }
-
     if (lines.length === 0) {
+      if (damaged) throw ERR_INVALID_RESPONSE
       lines.push(ctx.line.badge({ label: "Status", text: "No usage data", color: "#a3a3a3" }))
     }
 
+    const sub = fetchSubscription(ctx, apiKey)
+    const plan = sub && sub.productName ? ctx.fmt.planLabel(sub.productName) : null
     return { plan, lines }
   }
 

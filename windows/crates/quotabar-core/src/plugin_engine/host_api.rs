@@ -1323,15 +1323,12 @@ fn inject_crypto<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
 }
 
 fn inject_env<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquickjs::Result<()> {
+    let plugin_id = plugin_id.to_string();
     let env_obj = Object::new(ctx.clone())?;
-    let freebuff = plugin_id == "freebuff";
     env_obj.set(
         "get",
         Function::new(ctx.clone(), move |name: String| -> Option<String> {
-            if !WHITELISTED_ENV_VARS.contains(&name.as_str())
-                && !(freebuff && matches!(name.as_str(),
-                    "APPDATA" | "CODEBUFF_API_KEY" | "FREEBUFF_CONFIG_DIR" | "NEXT_PUBLIC_CB_ENVIRONMENT"))
-            {
+            if !env_allowed_for_plugin(&plugin_id, &name) {
                 return None;
             }
 
@@ -1340,6 +1337,20 @@ fn inject_env<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquic
     )?;
     host.set("env", env_obj)?;
     Ok(())
+}
+
+fn env_allowed_for_plugin(plugin_id: &str, name: &str) -> bool {
+    WHITELISTED_ENV_VARS.contains(&name)
+        || matches!(
+            (plugin_id, name),
+            ("openrouter", "OPENROUTER_API_KEY" | "OPENROUTER_KEY")
+                | ("copilot", "GH_CONFIG_DIR" | "LOCALAPPDATA" | "APPDATA")
+                | ("devin", "LOCALAPPDATA")
+                | (
+                    "freebuff",
+                    "APPDATA" | "CODEBUFF_API_KEY" | "FREEBUFF_CONFIG_DIR" | "NEXT_PUBLIC_CB_ENVIRONMENT"
+                )
+        )
 }
 
 fn inject_credentials<'js>(
@@ -4049,6 +4060,23 @@ abc
             assert!(status == "ok" || status == "no_data", "got {status}");
             assert!(v.get("data").and_then(|d| d.get("daily")).and_then(|d| d.as_array()).is_some());
         });
+    }
+
+    #[test]
+    fn provider_specific_environment_variables_are_scoped() {
+        for (plugin, name) in [
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("openrouter", "OPENROUTER_KEY"),
+            ("copilot", "GH_CONFIG_DIR"),
+            ("devin", "LOCALAPPDATA"),
+            ("freebuff", "APPDATA"),
+            ("freebuff", "CODEBUFF_API_KEY"),
+            ("freebuff", "FREEBUFF_CONFIG_DIR"),
+            ("freebuff", "NEXT_PUBLIC_CB_ENVIRONMENT"),
+        ] {
+            assert!(env_allowed_for_plugin(plugin, name));
+            assert!(!env_allowed_for_plugin("unrelated", name));
+        }
     }
 
     #[test]

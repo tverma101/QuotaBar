@@ -333,7 +333,59 @@ describe("grok plugin", () => {
     const result = plugin.probe(ctx)
 
     expect(result.lines.find((l) => l.label === "Weekly limit").used).toBe(25)
+    expect(result.lines.find((l) => l.label === "Weekly limit").periodDurationMs).toBe(31 * 86400000)
     expect(result.lines.find((l) => l.label === "Current period")).toBeUndefined()
+  })
+
+  it("does not label a legacy monthly pool as weekly", async () => {
+    const ctx = makeCtx()
+    writeAuth(ctx)
+    mockGrokApi(ctx, billingData({
+      currentPeriod: { ...billingData().config.currentPeriod, type: "USAGE_PERIOD_TYPE_MONTHLY" },
+    }))
+    const plugin = await loadPlugin()
+    expect(plugin.probe(ctx).lines.map(line => line.label)).toEqual(["Pay as you go"])
+  })
+
+  it.each([
+    { creditUsagePercent: true },
+    { onDemandCap: { val: "invalid" } },
+    { currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", start: "2026-06-02", end: "2026-06-01" } },
+  ])("rejects malformed billing: %j", async (override) => {
+    const ctx = makeCtx()
+    writeAuth(ctx)
+    mockGrokApi(ctx, billingData(override))
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Grok billing response changed.")
+  })
+
+  it("rotates only the selected account and leaves Grok CLI auth unchanged", async () => {
+    const ctx = makeCtx()
+    writeAuth(ctx)
+    ctx.host.fs.writeText.mockClear()
+    ctx.util.readProviderCredential = () => ({ accessToken: "selected", refreshToken: "selected-refresh" })
+    ctx.util.writeProviderCredential = vi.fn(() => true)
+    mockGrokApi(ctx)
+    const fallback = ctx.host.http.request.getMockImplementation()
+    let firstBilling = true
+    ctx.host.http.request.mockImplementation(req => {
+      if (req.url === REFRESH_URL) return {
+        status: 200, bodyText: JSON.stringify({ access_token: "rotated", refresh_token: "rotated-refresh", expires_in: 3600 }),
+      }
+      if (req.url === BILLING_URL && firstBilling) {
+        firstBilling = false
+        return { status: 401, bodyText: "" }
+      }
+      return fallback(req)
+    })
+    const plugin = await loadPlugin()
+    expect(plugin.probe(ctx).plan).toBe("SuperGrok Heavy")
+    expect(ctx.host.http.request.mock.calls.filter(([req]) => req.url === BILLING_URL)
+      .map(([req]) => req.headers.Authorization)).toEqual(["Bearer selected", "Bearer rotated"])
+    expect(ctx.util.writeProviderCredential).toHaveBeenCalledWith({
+      accessToken: "rotated", refreshToken: "rotated-refresh", expiresAt: Date.parse(ctx.nowIso) + 3600000,
+    })
+    expect(ctx.host.fs.writeText).not.toHaveBeenCalled()
   })
 
   it("reads the plan name from settings instead of auth email", async () => {
