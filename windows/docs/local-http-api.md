@@ -4,7 +4,7 @@ QuotaBar exposes a read-only HTTP API on the loopback interface so other local a
 
 **Base URL:** `http://127.0.0.1:6736`
 
-The server starts automatically with the app. If the port is already in use, the feature is silently disabled for that session.
+The server starts with the tray app. If the port is already in use, the app logs the bind failure and starts without the API.
 
 ## Manual smoke test (curl)
 
@@ -38,6 +38,8 @@ Returns a single cached usage snapshot for the given provider.
 - **204 No Content** — Provider is known but has no cached snapshot yet.
 - **404 Not Found** — Provider ID is unknown.
 
+Add `?scope=family` to receive an array of cached snapshots for every matching account, including an empty array when none have data.
+
 ### `GET /v1/limits`
 
 Machine-readable limits envelope (`schema: "quotabar.limits.v1"`) derived from **cached** progress lines for enabled providers. Prefer this for automation; `/v1/usage` stays UI-shaped.
@@ -46,27 +48,26 @@ Machine-readable limits envelope (`schema: "quotabar.limits.v1"`) derived from *
 
 ### `GET /v1/limits/:providerId`
 
-Same envelope scoped to one provider (still under `providers.{id}`).
+Same envelope scoped to the matching provider or account family.
 
-- **200 OK** — limits document with one provider entry.
-- **204 No Content** — Provider known but uncached.
+- **200 OK** — limits document with every matching provider that has a cached snapshot. A known provider without cached data does not appear in `providers`. A failed refresh appears in `errors`.
 - **404 Not Found** — Unknown provider.
 
-CLI equivalent (live probe, not cache): `quotabar-cli limits [ids…]`.
+The Windows CLI uses the same envelope. `quotabar-cli read <provider>` reuses fresh snapshots and refreshes stale or missing data. [CLI guide](../../docs/cli.md#windows)
 
 ### `GET /v1/history/quota`
 
-Returns quota snapshot history from local SQLite when **Settings → Save usage snapshots** is enabled.
+Returns quota snapshot history from local SQLite when **Save usage snapshots after successful refreshes** is enabled in **Settings → Advanced**.
 
 - **200 OK** — JSON array (empty `[]` when persist is off or no rows).
-- Query: `?limit=200` (default `80`, max `2000`).
+- Query: `?limit=200` (default `80`, max `500`).
 
 ### `GET /v1/history/daily`
 
 Returns daily token rows from local SQLite (`usage_daily`).
 
 - **200 OK** — JSON array (empty `[]` when persist is off or no rows).
-- Query: `?limit=120` (default `120`, max `2000`).
+- Query: `?limit=120` (default `120`, max `500`).
 
 ### `GET /v1/insights`
 

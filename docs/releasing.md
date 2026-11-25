@@ -37,7 +37,11 @@ Before publishing, install from that image on a clean Mac user profile with Gate
 
 ## Windows
 
-Run the **Windows CI** workflow manually on the approved release tag. The workflow tests the per-user install, bundled CLI, cached limits, and uninstall before uploading the `quotabar-windows-x64-qa` artifact. To build locally, check out the same tag on Windows x64 and run these commands from PowerShell in `windows/`:
+Create the owner-approved version tag from the tested commit on `main`. Run **Windows CI** on that tag. The workflow uses the tag as the installer version and tests the per-user install, bundled CLI, cached limits, and uninstall before uploading `quotabar-windows-x64-qa`.
+
+Download the artifact from that run and verify its archive SHA-256 against the digest reported by GitHub Actions. Extract the matching `QuotaBar_<version>_x64-setup.exe`. The build uses MSVC for the public installer.
+
+To reproduce the tagged build locally, check out the same tag on Windows x64 and run these commands from PowerShell in `windows/`.
 
 ```powershell
 $tag = git describe --exact-match --tags HEAD
@@ -51,23 +55,12 @@ bun run test
 bun run tauri:build --bundles nsis --config $config -- --locked
 ```
 
-Use the default MSVC Rust toolchain for releases. On a GNU Rust development VM, select the GNU
-target explicitly with `--target x86_64-pc-windows-gnu` to build a local QA installer.
-If using the shell artifact collector after a GNU build with a tag-based version override, set
-`QUOTABAR_INSTALLER_VERSION` to the same version without the leading `v`.
+Publish an unsigned Windows prerelease when the owner approves it. State that the installer is unsigned and Windows may show a SmartScreen or publisher prompt. For a signed build, sign the app and CLI before packaging, then sign the installer. Use `Get-AuthenticodeSignature` to check that the installer and both installed executables report `Valid` and the expected signer.
 
-The CI installer is a QA artifact. Before publishing, Authenticode-sign the installer and both bundled
-executables with the release publisher's Windows code-signing identity. Sign the app and CLI before
-packing the installer. Use `Get-AuthenticodeSignature` on the installer and both installed executables;
-each must report `Valid` and the expected signer. QuotaBar does not use an updater or upstream feed.
-
-Run `./scripts/smoke-installer.ps1 -Installer <setup.exe>` in a disposable user profile to verify the
-per-user install, bundled providers, CLI and uninstall. For release, repeat on Windows 11 x64 both with
-WebView2 installed and with a clean runtime state. Check first launch, Settings, tray dismiss and reopen,
-provider refresh, and the [local HTTP API](../windows/docs/local-http-api.md) while the panel is closed. Verify that
-Start on Login and Start Hidden work, an upgrade preserves settings and provider selection, and
-uninstall removes the executables and Start menu shortcut.
+To repeat the CI smoke test in a disposable user profile, run `./scripts/smoke-installer.ps1 -Installer <setup.exe>` from `windows/`. For Windows 11 x64 desktop QA, check first launch, Settings, tray reopen, and a refresh while the panel is closed. Verify a clean WebView2 setup and an upgrade from the previous beta that retains layout and provider settings. Record which cases ran in the release notes. [Windows local API](../windows/docs/local-http-api.md)
 
 ## GitHub
 
-Attach the verified installers for the platforms shipping in the release. Mark beta releases as pre-releases. State the Windows signature status, and link to the source build instructions for any platform without a download. Verify each public download link while signed out.
+Create a draft GitHub release for the approved tag. Attach each tested installer and a `SHA256SUMS.txt` with the hash of each attached binary. Mark beta releases as prereleases. State the platforms included, link to source build instructions for other platforms, and link to the tagged CI run.
+
+After publishing, download each asset without GitHub credentials and verify the installer hashes against the published checksum file. Link the current installer and release notes in the READMEs, and move the shipped changes from **Unreleased** into their version section in the changelog. [GitHub Releases](https://github.com/tverma101/QuotaBar/releases)

@@ -54,14 +54,6 @@ Port of `WidgetRowView.swift`:
 - **Density** (`regular` | `compact`) — row padding/fonts via `data-density` on shell
 - **Reduce transparency** — use existing `themeMode` solid/glass paths
 
-## Release (1.1.1 at upstream GA)
+## Releases
 
-When upstream tags **`v0.7.0`** (non-prerelease):
-
-1. `git fetch upstream --tags`
-2. `git diff feat/port-openusage-0.7-prep...v0.7.0 -- plugins/` — gap-fill
-3. Diff `upstream/swift` UI commits since last port; adjust Modern components
-4. `bun run test`, `cargo test`, manual Classic + Modern smoke
-5. Bump **1.1.1**, release; ~7d later merge **1.2.0** polish branch
-
-See [FORK-UPSTREAM.md](./FORK-UPSTREAM.md).
+Build and test the installer from the owner-approved QuotaBar tag. [Windows release process](../../docs/releasing.md#windows) · [Upstream port history](FORK-UPSTREAM.md)
