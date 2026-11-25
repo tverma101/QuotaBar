@@ -122,6 +122,53 @@ final class RefreshPacingRegressionTests: XCTestCase {
         )
     }
 
+    func testPanelOpenAloneDoesNotStartAnAllProviderMeterPass() {
+        XCTAssertFalse(AppContainer.runsAllMeterRefresh(
+            meterPassPending: false,
+            panelOpen: true,
+            quotaRefreshDue: false,
+            lastAllMeterCheckUptime: nil,
+            nowUptime: 100
+        ))
+    }
+
+    func testOpenPanelMeterDeadlineStillRefreshesAllVisibleCards() {
+        XCTAssertTrue(AppContainer.runsAllMeterRefresh(
+            meterPassPending: false,
+            panelOpen: true,
+            quotaRefreshDue: true,
+            lastAllMeterCheckUptime: 40,
+            nowUptime: 100
+        ))
+    }
+
+    func testClosedPanelRefreshesUnpinnedMetersAtLaunchAndAtTheBackgroundDeadline() {
+        let lastAllMeterCheckUptime: TimeInterval = 100
+        let deadline = lastAllMeterCheckUptime + RefreshSetting.backgroundAllMeterInterval
+
+        XCTAssertTrue(AppContainer.runsAllMeterRefresh(
+            meterPassPending: false,
+            panelOpen: false,
+            quotaRefreshDue: true,
+            lastAllMeterCheckUptime: nil,
+            nowUptime: lastAllMeterCheckUptime
+        ))
+        XCTAssertFalse(AppContainer.runsAllMeterRefresh(
+            meterPassPending: false,
+            panelOpen: false,
+            quotaRefreshDue: true,
+            lastAllMeterCheckUptime: lastAllMeterCheckUptime,
+            nowUptime: deadline - 1
+        ))
+        XCTAssertTrue(AppContainer.runsAllMeterRefresh(
+            meterPassPending: false,
+            panelOpen: false,
+            quotaRefreshDue: true,
+            lastAllMeterCheckUptime: lastAllMeterCheckUptime,
+            nowUptime: deadline
+        ))
+    }
+
     func testLedgerAccountingWorkIsPriorityDuringTriggerCooldown() {
         XCTAssertTrue(AppContainer.hasPriorityRefreshPass(
             quotaRefreshDue: false,

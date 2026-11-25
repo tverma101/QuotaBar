@@ -71,11 +71,10 @@ extension LayoutStore {
     /// provider's metrics kept in the provider's custom metric order. Drives the grouped dashboard list; providers with
     /// no visible metric are dropped so the dashboard only shows groups that have something to show.
     var displayGroups: [ProviderGroup] {
-        orderedProviders().compactMap { provider in
+        let placedByProvider = Dictionary(grouping: visiblePlaced, by: providerID(of:))
+        return orderedProviders().compactMap { provider in
             let widgetsByDescriptor = Dictionary(
-                visiblePlaced
-                    .filter { providerID(of: $0) == provider.id }
-                    .map { ($0.descriptorID, $0) },
+                (placedByProvider[provider.id] ?? []).map { ($0.descriptorID, $0) },
                 uniquingKeysWith: { first, _ in first }
             )
             let widgets = metricOrder(for: provider.id).compactMap { widgetsByDescriptor[$0] }

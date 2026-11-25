@@ -1,8 +1,91 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import QuotaBar
 
 @MainActor
 final class ProviderSectionVisibilityTests: XCTestCase {
+    func testShortDashboardViewportReadsOnlyNearbyProviderSnapshots() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "QuotaBarTests.LazyDashboard.\(UUID())"))
+        let providers = (0..<100).map {
+            Provider(id: "fixture-\($0)", displayName: "Provider \($0)", icon: .providerMark("codex"))
+        }
+        let descriptors = providers.map { provider in
+            WidgetDescriptor(
+                id: "\(provider.id).weekly", providerID: provider.id, metricLabel: "Weekly",
+                sample: WidgetData(title: "Weekly", icon: provider.icon, kind: .percent, used: 0, limit: 100)
+            )
+        }
+        let registry = WidgetRegistry(providers: providers, descriptors: descriptors)
+        let layout = LayoutStore(
+            registry: registry, defaults: defaults, defaultMetricIDs: descriptors.map(\.id)
+        )
+        let now = Date()
+        var snapshotReads = 0
+        let store = WidgetDataStore(registry: registry, providers: [], defaults: defaults, now: {
+            snapshotReads += 1
+            return now
+        })
+        store.snapshots = Dictionary(uniqueKeysWithValues: providers.map { provider in
+            (provider.id, ProviderSnapshot.make(
+                provider: provider,
+                plan: nil,
+                lines: [.progress(label: "Weekly", used: 25, limit: 100, format: .percent)],
+                refreshedAt: now
+            ))
+        })
+        let groups = layout.displayGroups
+        XCTAssertEqual(groups.count, providers.count)
+        snapshotReads = 0
+
+        let dashboard = PopoverScrollView {
+            WidgetGroupedListView(groups: groups, reorderSpaceName: "fixture", reorderLift: .constant(nil))
+        }
+        .environment(layout)
+        .environment(store)
+        .environment(ProviderEnablementStore(defaults: defaults))
+        .frame(width: 320, height: 240)
+        let host = NSHostingView(rootView: dashboard)
+        host.setFrameSize(NSSize(width: 320, height: 240))
+        host.layoutSubtreeIfNeeded()
+        let bitmap: NSBitmapImageRep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+
+        XCTAssertGreaterThan(snapshotReads, 0)
+        XCTAssertLessThan(snapshotReads, providers.count, "offscreen cards should not read their snapshots")
+    }
+
+    func testCollapsedCardResolvesOnlyItsAlwaysVisibleMetrics() {
+        let always = ["session", "weekly"].map { PlacedWidget(descriptorID: $0) }
+        let onDemand = ["today", "history"].map { PlacedWidget(descriptorID: $0) }
+        var resolvedIDs: [String] = []
+        let collapsed = ProviderSectionVisibility.resolveMetrics(always: always, onDemand: onDemand, isExpanded: false) {
+            resolvedIDs.append($0.descriptorID)
+            return $0.descriptorID
+        }
+        XCTAssertEqual(resolvedIDs, ["session", "weekly"])
+        XCTAssertTrue(collapsed.hasVisibleMetric)
+        XCTAssertTrue(collapsed.expanded.isEmpty)
+
+        let expanded = ProviderSectionVisibility.resolveMetrics(always: always, onDemand: onDemand, isExpanded: true) {
+            $0.descriptorID
+        }
+        XCTAssertEqual(expanded.expanded, ["today", "history"])
+    }
+
+    func testCollapsedCardKeepsItsCaretWhenOnlyAnOnDemandMetricCanRender() {
+        let always = [PlacedWidget(descriptorID: "unavailable")]
+        let onDemand = ["empty", "today", "history"].map { PlacedWidget(descriptorID: $0) }
+        var resolvedIDs: [String] = []
+        let rows = ProviderSectionVisibility.resolveMetrics(always: always, onDemand: onDemand, isExpanded: false) {
+            resolvedIDs.append($0.descriptorID)
+            return $0.descriptorID == "today" ? $0.descriptorID : nil
+        }
+        XCTAssertEqual(resolvedIDs, ["unavailable", "empty", "today"])
+        XCTAssertTrue(rows.hasVisibleMetric)
+        XCTAssertTrue(rows.expanded.isEmpty)
+    }
+
     func testProviderSectionStaysVisibleForHeaderOnlyPlanAndStatusStates() {
         XCTAssertTrue(ProviderSectionVisibility.shouldRender(
             hasVisibleMetric: false,
