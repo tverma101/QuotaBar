@@ -10,11 +10,12 @@ import SwiftUI
 /// obvious place to do the same plus toggle metrics on/off. Both surfaces use the same local gesture/geometry
 /// helper so they work inside the menu-bar popover without a system drag/drop session.
 struct WidgetGroupedListView: View {
-    @Environment(AppContainer.self) private var container
+    @Environment(ProviderEnablementStore.self) private var enablement
     @Environment(LayoutStore.self) private var layout
     @Environment(WidgetDataStore.self) private var dataStore
     @Environment(PopoverTransparencyStore.self) private var transparency: PopoverTransparencyStore?
     @Environment(\.colorScheme) private var colorScheme
+    let groups: [ProviderGroup]
     let reorderSpaceName: String
     @Binding var reorderLift: ReorderLift?
 
@@ -24,14 +25,7 @@ struct WidgetGroupedListView: View {
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
     var body: some View {
-        // Provider-section spacing is noticeably wider than the in-card row rhythm (so groups
-        // still read as groups); the exact step comes from the density setting.
-        //
-        // `displayGroups` is a computed property that rebuilds dictionaries + filters per access;
-        // capture it once per body evaluation so the `.animation` identity doesn't recompute the
-        // whole thing a second time.
-        let groups = layout.displayGroups
-        return VStack(alignment: .leading, spacing: density.sectionSpacing) {
+        LazyVStack(alignment: .leading, spacing: density.sectionSpacing) {
             ForEach(groups) { group in
                 section(group)
             }
@@ -108,7 +102,7 @@ struct WidgetGroupedListView: View {
             // Hides the whole provider section (the Customize provider list brings it back). Mirrors
             // the per-metric "Hide" but one level up, so the verb order reads the same on a header as a row.
             Button {
-                container.enablement.setEnabled(false, for: group.provider.id)
+                enablement.setEnabled(false, for: group.provider.id)
             } label: {
                 AccountNameText(text: "Hide \(group.provider.displayName)", font: .system(size: 13), interactiveReveal: false)
             }
@@ -194,24 +188,28 @@ struct WidgetGroupedListView: View {
         // Resolve each row's descriptor + data exactly once per render, then reuse it for the
         // visibility decision, the neighbor-aware condensing rule, and the row itself.
         let isExpanded = layout.isProviderExpanded(group.provider.id)
-        let alwaysRows = resolvedRows(group.alwaysShownWidgets)
-        let expandedRows = resolvedRows(group.expandedWidgets)
+        let rows = ProviderSectionVisibility.resolveMetrics(
+            always: group.alwaysShownWidgets,
+            onDemand: group.expandedWidgets,
+            isExpanded: isExpanded,
+            resolve: resolvedRow
+        )
         // The caret separates Always Visible and On Demand rows, so text-row condensing should not
         // bridge across it. Each side tightens only against rows on the same side of the separator.
         let condensedIDs = visibleCondensedTextRowIDs(
-            alwaysRows: alwaysRows,
-            expandedRows: isExpanded ? expandedRows : []
+            alwaysRows: rows.always,
+            expandedRows: rows.expanded
         )
         return ResolvedCard(
             cardRows: metricCardRows(
-                alwaysRows: alwaysRows,
-                expandedRows: expandedRows,
+                alwaysRows: rows.always,
+                expandedRows: rows.expanded,
                 hasExpandedMetrics: group.hasExpandedMetrics,
                 isExpanded: isExpanded,
                 links: group.provider.visibleLinks
             ),
             condensedIDs: condensedIDs,
-            hasVisibleRow: !alwaysRows.isEmpty || !expandedRows.isEmpty
+            hasVisibleRow: rows.hasVisibleMetric
         )
     }
 
@@ -248,26 +246,17 @@ struct WidgetGroupedListView: View {
     /// Deliberately a presentation filter rather than a layout change: Customize still lists the row,
     /// menu-bar pins still render it, and quota alerts still fire off the underlying data. Removing it
     /// from `placed` instead would quietly switch all three off.
-    private func resolvedRows(_ widgets: [PlacedWidget]) -> [ResolvedRow] {
-        widgets.compactMap { widget -> ResolvedRow? in
-            guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            let data = dataStore.data(for: descriptor)
-            if !ProviderSectionVisibility.shouldRenderMetricRow(
-                providerID: descriptor.providerID,
-                descriptorID: descriptor.id,
-                hasData: data.hasData,
-                errorCategory: dataStore.errorCategory(for: descriptor.providerID),
-                explicitlyEnabled: layout.explicitlyEnabledMetricIDs.contains(descriptor.id)
-            ) {
-                return nil
-            }
-            guard layout.showsRow(descriptor, hasData: data.hasData) else { return nil }
-            return ResolvedRow(
-                widget: widget,
-                descriptor: descriptor,
-                data: data
-            )
-        }
+    private func resolvedRow(_ widget: PlacedWidget) -> ResolvedRow? {
+        guard let descriptor = layout.descriptor(for: widget) else { return nil }
+        let data = dataStore.data(for: descriptor)
+        guard ProviderSectionVisibility.shouldRenderMetricRow(
+            providerID: descriptor.providerID,
+            descriptorID: descriptor.id,
+            hasData: data.hasData,
+            errorCategory: dataStore.errorCategory(for: descriptor.providerID),
+            explicitlyEnabled: layout.explicitlyEnabledMetricIDs.contains(descriptor.id)
+        ), layout.showsRow(descriptor, hasData: data.hasData) else { return nil }
+        return ResolvedRow(widget: widget, descriptor: descriptor, data: data)
     }
 
     private func metricCardRows(
