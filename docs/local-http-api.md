@@ -49,6 +49,10 @@ Works for disabled providers too.
 > provider had no snapshot. It now always returns an array, so the shape stays identical whether an
 > ID names one provider or a whole account family.
 
+On Windows, the deprecated route still returns a single snapshot (or `204`) for existing scripts.
+Add `?scope=family` to request the array contract, or use `/v1/limits/:id` for family matching by default.
+Windows limits retain the existing `quotabar.limits.v1` schema ID.
+
 ### Everything else
 
 Methods other than `GET`/`OPTIONS` return **405**; unknown routes return **404**. When the server is already handling its maximum of 16 concurrent connections, requests get **503** — back off and retry.

@@ -1,13 +1,10 @@
-use crate::plugin_engine::runtime::{MetricLine, PluginOutput};
-use serde::{Deserialize, Serialize};
+use crate::plugin_engine::runtime::PluginOutput;
+pub(super) use quotabar_core::usage_snapshot::CachedPluginSnapshot;
+use quotabar_core::usage_snapshot::{CACHE_FILE_NAME, PluginSelection, UsageApiCacheFile, read_cache};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-
-const CACHE_FILE_NAME: &str = "usage-api-cache.json";
-const SETTINGS_FILE_NAME: &str = "settings.json";
-const DEFAULT_ENABLED_PLUGINS: &[&str] = &["claude", "codex", "cursor"];
 
 #[cfg(not(test))]
 const CACHE_WRITE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -19,27 +16,9 @@ const CACHE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CachedPluginSnapshot {
-    pub provider_id: String,
-    pub display_name: String,
-    pub plan: Option<String>,
-    #[serde(default)]
-    pub warning: Option<String>,
-    pub lines: Vec<MetricLine>,
-    pub fetched_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageApiCacheFile {
-    version: u32,
-    snapshots: HashMap<String, CachedPluginSnapshot>,
-}
-
 pub(super) struct CacheState {
     pub snapshots: HashMap<String, CachedPluginSnapshot>,
+    pub failed_providers: HashSet<String>,
     pub app_data_dir: PathBuf,
     pub known_plugin_ids: Vec<String>,
     dirty_generation: u64,
@@ -63,6 +42,7 @@ pub(super) fn cache_state() -> &'static Mutex<CacheState> {
     STATE.get_or_init(|| {
         Mutex::new(CacheState {
             snapshots: HashMap::new(),
+            failed_providers: HashSet::new(),
             app_data_dir: PathBuf::new(),
             known_plugin_ids: Vec::new(),
             dirty_generation: 0,
@@ -82,17 +62,8 @@ fn cache_write_lock() -> &'static Mutex<()> {
 // ---------------------------------------------------------------------------
 
 pub fn load_cache(app_data_dir: &Path) -> HashMap<String, CachedPluginSnapshot> {
-    let path = app_data_dir.join(CACHE_FILE_NAME);
-    let data = match std::fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(_) => return HashMap::new(),
-    };
-    match serde_json::from_str::<UsageApiCacheFile>(&data) {
-        Ok(file) if file.version == 1 => file.snapshots,
-        Ok(_) => {
-            log::warn!("usage-api-cache.json has unsupported version, starting empty");
-            HashMap::new()
-        }
+    match read_cache(app_data_dir) {
+        Ok(snapshots) => snapshots,
         Err(e) => {
             log::warn!(
                 "failed to parse usage-api-cache.json: {}, starting empty",
@@ -221,6 +192,7 @@ pub fn init(app_data_dir: &Path, known_plugin_ids: Vec<String>) {
     let snapshots = load_cache(app_data_dir);
     let mut state = cache_state().lock().expect("cache state poisoned");
     state.snapshots = snapshots;
+    state.failed_providers.clear();
     state.app_data_dir = app_data_dir.to_path_buf();
     state.known_plugin_ids = known_plugin_ids;
     state.dirty_generation = 0;
@@ -229,21 +201,17 @@ pub fn init(app_data_dir: &Path, known_plugin_ids: Vec<String>) {
 }
 
 pub fn cache_successful_output(output: &PluginOutput) {
-    let fetched_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    let snapshot = CachedPluginSnapshot {
-        provider_id: output.provider_id.clone(),
-        display_name: output.display_name.clone(),
-        plan: output.plan.clone(),
-        warning: output.warning.clone(),
-        lines: output.lines.clone(),
-        fetched_at,
-    };
-
+    let snapshot = CachedPluginSnapshot::from_output(output.clone(), chrono::Utc::now());
     let mut state = cache_state().lock().expect("cache state poisoned");
+    state.failed_providers.remove(&output.provider_id);
     state.snapshots.insert(output.provider_id.clone(), snapshot);
     state.dirty_generation = state.dirty_generation.wrapping_add(1);
     schedule_cache_flush_locked(&mut state);
+}
+
+pub fn record_probe_failure(provider_id: &str) {
+    let mut state = cache_state().lock().expect("cache state poisoned");
+    state.failed_providers.insert(provider_id.to_string());
 }
 
 pub fn flush_cache() {
@@ -256,69 +224,21 @@ pub fn flush_cache() {
 // Settings reader (reads settings.json directly, not via tauri_plugin_store)
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct SettingsFile {
-    plugins: Option<PluginSettingsJson>,
-}
-
-#[derive(Deserialize)]
-struct PluginSettingsJson {
-    order: Option<Vec<String>>,
-    disabled: Option<Vec<String>>,
-}
-
-fn read_plugin_settings(app_data_dir: &Path) -> (Vec<String>, HashSet<String>, bool) {
-    let path = app_data_dir.join(SETTINGS_FILE_NAME);
-    let data = match std::fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(_) => return (Vec::new(), HashSet::new(), false),
-    };
-    match serde_json::from_str::<SettingsFile>(&data) {
-        Ok(sf) => {
-            let ps = sf.plugins.unwrap_or(PluginSettingsJson {
-                order: None,
-                disabled: None,
-            });
-            let has_settings = ps.order.is_some() || ps.disabled.is_some();
-            let order = ps.order.unwrap_or_default();
-            let disabled: HashSet<String> = ps.disabled.unwrap_or_default().into_iter().collect();
-            (order, disabled, has_settings)
-        }
-        Err(_) => (Vec::new(), HashSet::new(), false),
+pub(super) fn read_plugin_selection(state: &CacheState) -> PluginSelection {
+    if state.app_data_dir.as_os_str().is_empty() {
+        return PluginSelection::default();
     }
+    PluginSelection::read(&state.app_data_dir).unwrap_or_else(|err| {
+        log::warn!("could not read API provider settings: {err}");
+        PluginSelection::default()
+    })
 }
 
 /// Build the ordered list of enabled cached snapshots for GET /v1/usage.
 pub(super) fn enabled_snapshots_ordered(state: &CacheState) -> Vec<CachedPluginSnapshot> {
-    let (settings_order, disabled, has_settings) = read_plugin_settings(&state.app_data_dir);
-
-    let default_enabled: HashSet<&str> = DEFAULT_ENABLED_PLUGINS.iter().copied().collect();
-
-    let is_enabled = |id: &str| -> bool {
-        if has_settings {
-            !disabled.contains(id)
-        } else {
-            default_enabled.contains(id)
-        }
-    };
-
-    // Build ordered plugin ids: settings order first, then remaining known ids.
-    let mut ordered: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    for id in &settings_order {
-        if seen.insert(id.clone()) {
-            ordered.push(id.clone());
-        }
-    }
-    for id in &state.known_plugin_ids {
-        if seen.insert(id.clone()) {
-            ordered.push(id.clone());
-        }
-    }
-
-    ordered
+    read_plugin_selection(state)
+        .matching_ids(&state.known_plugin_ids, None)
         .into_iter()
-        .filter(|id| is_enabled(id))
         .filter_map(|id| state.snapshots.get(&id).cloned())
         .collect()
 }
