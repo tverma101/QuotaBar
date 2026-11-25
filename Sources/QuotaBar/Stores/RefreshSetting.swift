@@ -4,8 +4,8 @@ import Foundation
 ///
 /// `interval` is the full-detail cadence and cache age for local accounting. Quota meters use a
 /// separate one-minute cache/deadline because menu-bar passes skip heavy history folds. While the
-/// panel is closed, the scheduled history fold widens to `backgroundHistoryInterval`; opening the
-/// panel always runs a fresh two-phase pass regardless of the deadline.
+/// panel is closed, the scheduled history fold widens to `backgroundHistoryInterval`. Opening
+/// the panel shows snapshots immediately. The next periodic wake adopts the visible cadence.
 enum RefreshSetting {
     static let defaultMinutes = 5
     static let quotaMinutes = 1
@@ -13,8 +13,7 @@ enum RefreshSetting {
     static let onBatteryBackgroundMinutes = 2
     /// Scheduled history folds while the panel is closed. Background spend parsing is the
     /// app's largest recurring CPU consumer, and a spend dashboard nobody is looking at does not
-    /// need a five-minute rebuild. Panel opens always run a fresh fold (two-phase panel pass) and
-    /// ledger wakes still trigger narrow folds, so this only widens the idle deadline.
+    /// need a five-minute rebuild. Ledger wakes still trigger narrow folds.
     static let backgroundHistoryMinutes = 15
 
     /// Cache TTL / full-refresh wait while the panel is open. Fixed at 5 minutes so tests and
@@ -44,9 +43,10 @@ enum RefreshSetting {
         return quotaInterval
     }
 
-    /// Scheduled history folds while the panel is closed (15 minutes). Panel opens and explicit
-    /// refreshes still fold on demand, so freshness where the user can see it is unchanged; this
-    /// only widens the idle deadline for a dashboard nobody is looking at.
+    /// The next regular quota tick at or after this interval also checks unpinned providers.
+    static let backgroundAllMeterInterval: TimeInterval = 5 * 60
+
+    /// Scheduled history folds while the panel is closed (15 minutes).
     static var backgroundHistoryInterval: TimeInterval {
         TimeInterval(backgroundHistoryMinutes * 60)
     }

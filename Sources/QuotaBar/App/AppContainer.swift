@@ -523,7 +523,6 @@ final class AppContainer {
                 ProviderEnablementStore.didChangeNotification,
                 CodexRouterLedgerWatcher.didChangeNotification,
                 BackgroundRefreshTrigger.didChangeNotification,
-                PopoverTransparencyStore.panelVisibilityDidChangeNotification
             ])
             dataStore.onDeferredRefreshReady = { [weak wakeSignal] request in
                 wakeSignal?.signalDeferredRefreshReady(request)
@@ -549,6 +548,8 @@ final class AppContainer {
             /// can wake faster than its local folds finish; measuring the next wait from every fold
             /// let a buffered ledger wake keep postponing menu-bar quota refreshes indefinitely.
             var lastQuotaRefreshUptime: TimeInterval?
+            // Pinned-only ticks cannot postpone checks for the other providers.
+            var lastAllMeterCheckUptime: TimeInterval?
             /// Detect manual/panel meter attempts made outside this loop so their already-fresh cache
             /// does not make the next due tick postpone the real fetch by another full interval.
             var lastObservedLiveQuotaRefreshUptime = dataStore.lastLiveQuotaRefreshUptime
@@ -564,12 +565,7 @@ final class AppContainer {
             /// `.localAccounting` scope: the codex/opencode local folds recompute without re-reading
             /// live quota APIs, so Today tracks routed turns even while the panel is closed.
             var pendingLocalAccountingPass = false
-            /// Latched by the panel-open edge and consumed by the next pass, which runs the
-            /// two-phase panel sequence (`.panelMeters` then `.panelAccounting`). Unlike the old
-            /// `.full` latch this one never widens to a full pass: the panel's own two phases cover
-            /// both the meters and the local accounting. Set when the panel closes again before the
-            /// pass starts, the phases still run — the meter stamps they produce stay fresh for the
-            /// next open.
+            /// Set when a deferred panel meter pass is ready to resume.
             var pendingPanelPass = false
             /// Accounting folds run in a tracked task so they cannot block the next meter deadline.
             var pendingHistoryAccountingPass = false
@@ -605,8 +601,8 @@ final class AppContainer {
                     : RefreshSetting.backgroundInterval
                 // Closed-panel history folds widen to the idle deadline (15 min): the background
                 // spend parse is the app's largest recurring CPU consumer, and a spend dashboard
-                // nobody is looking at does not need a five-minute rebuild. Panel opens always
-                // run a fresh two-phase pass; iCloud Sync (when provisioned and enabled) keeps the
+                // nobody is looking at does not need a five-minute rebuild. iCloud Sync
+                // (when provisioned and enabled) keeps the
                 // five-minute cadence so peer machines see fresh machine history.
                 let historyRefreshInterval = panelOpen || isICloudSyncEnabled()
                     ? RefreshSetting.interval
@@ -687,12 +683,13 @@ final class AppContainer {
                     if panelOpen && !ProcessMemoryBudget.isOverSoftLimit {
                         await CodexRouterUsageScanner.resumeSharedParsedItems()
                     }
-                    // All-enabled meter work runs before history folds, whether caused by a panel open,
-                    // external refresh, daily rollover, or the five-minute history cadence. Closed-panel
-                    // minute ticks stay pinned-only. Every fold then runs asynchronously so a slow local
-                    // corpus cannot hold later subscription meter deadlines.
-                    let runAllMeters = pendingFullScopePass || pendingPanelPass
-                        || (panelOpen && quotaRefreshDue)
+                    let runAllMeters = Self.runsAllMeterRefresh(
+                        meterPassPending: pendingFullScopePass || pendingPanelPass,
+                        panelOpen: panelOpen,
+                        quotaRefreshDue: quotaRefreshDue,
+                        lastAllMeterCheckUptime: lastAllMeterCheckUptime,
+                        nowUptime: nowUptime
+                    )
                     if runAllMeters || quotaRefreshDue || pendingMenuBarMeterRetry {
                         passRan = true
                         let requestsHistoryFold = pendingFullScopePass || pendingPanelPass || newlyDueHistoryPass
@@ -719,6 +716,7 @@ final class AppContainer {
                             dataStore.markQuotaRefreshCheckCompleted()
                         }
                         if runAllMeters {
+                            lastAllMeterCheckUptime = nowUptime
                             pendingFullScopePass = false
                             pendingPanelPass = false
                             if requestsHistoryFold {
@@ -868,11 +866,6 @@ final class AppContainer {
                         } else {
                             AppLog.debug(.refresh, "ignoring CodexRouter ledger wake (no enabled Codex cards)")
                         }
-                    case PopoverTransparencyStore.panelVisibilityDidChangeNotification:
-                        // The store posts on the open edge only. Latch the two-phase panel pass so
-                        // the panel's first paint is followed by fresh meters and folds even if the
-                        // user closes it again before the pass starts.
-                        pendingPanelPass = true
                     case ProviderEnablementStore.didChangeNotification:
                         // A full pass covers the newly-enabled provider and runs alongside any distinct
                         // ledger wake retained by RefreshWakeSignal. Its cache keeps unrelated providers cheap.
@@ -941,6 +934,21 @@ final class AppContainer {
             URLCache.shared.removeAllCachedResponses()
             ProcessMemoryBudget.releaseAllocatorFreePages()
         }
+    }
+
+    nonisolated static func runsAllMeterRefresh(
+        meterPassPending: Bool,
+        panelOpen: Bool,
+        quotaRefreshDue: Bool,
+        lastAllMeterCheckUptime: TimeInterval?,
+        nowUptime: TimeInterval
+    ) -> Bool {
+        if meterPassPending { return true }
+        guard quotaRefreshDue else { return false }
+        let backgroundAllMetersDue = lastAllMeterCheckUptime.map {
+            nowUptime - $0 >= RefreshSetting.backgroundAllMeterInterval
+        } ?? true
+        return panelOpen || backgroundAllMetersDue
     }
 
     nonisolated static func hasPriorityRefreshPass(
