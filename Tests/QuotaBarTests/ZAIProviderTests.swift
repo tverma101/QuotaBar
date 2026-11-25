@@ -562,7 +562,7 @@ final class ZAIProviderTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("db.sqlite").path
         let nowMs = Int(Date().timeIntervalSince1970 * 1000)
-        try SQLiteCLIAccessor().execute(path: path, sql: """
+        try NativeSQLiteAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (1000, 200, 'account:zai-start-plan', \(nowMs));
             """)

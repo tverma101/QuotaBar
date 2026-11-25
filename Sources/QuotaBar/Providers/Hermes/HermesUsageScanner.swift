@@ -73,7 +73,7 @@ struct HermesUsageScanner: Sendable {
     var calendar: Calendar
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(),
         databasePaths: @escaping @Sendable () throws -> [String] = HermesUsageScanner.defaultDatabasePaths,
         calendar: Calendar = .current
     ) {

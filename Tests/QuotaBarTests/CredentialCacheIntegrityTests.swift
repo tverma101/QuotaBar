@@ -14,108 +14,28 @@ final class CredentialSystemClientIntegrityTests: XCTestCase {
         XCTAssertThrowsError(try LocalTextFileAccessor().readTextIfPresent(directory.path))
     }
 
-    func testSQLiteQueryDoesNotLaunchForMissingDatabase() throws {
-        let runner = CredentialCountingProcessRunner()
+    func testSQLiteQueryDoesNotCreateMissingDatabase() throws {
         let path = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OpenUsageTests.missing.\(UUID().uuidString).sqlite")
-
-        XCTAssertNil(
-            try SQLiteCLIAccessor(processRunner: runner)
-                .queryValue(path: path.path, sql: "SELECT value FROM ItemTable LIMIT 1")
-        )
-        XCTAssertEqual(runner.callCount, 0)
+            .appendingPathComponent("QuotaBarTests.missing.\(UUID().uuidString).sqlite")
+        XCTAssertNil(try NativeSQLiteAccessor().queryValue(path: path.path, sql: "SELECT 1"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
     }
 
-    func testSQLiteQueryOpensExistingDatabaseReadOnly() throws {
-        let database = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OpenUsageTests.existing.\(UUID().uuidString).sqlite")
-        try Data().write(to: database)
-        defer { try? FileManager.default.removeItem(at: database) }
-        let runner = CredentialCountingProcessRunner()
+    func testSQLiteReadCannotWriteAndPreservesListOutput() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QuotaBarTests.native.\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: path) }
+        let sqlite = NativeSQLiteAccessor(allowsReadWriteFallback: false)
+        try sqlite.execute(path: path.path, sql: """
+            CREATE TABLE items (id INTEGER, value TEXT);
+            INSERT INTO items VALUES (1, 'example'), (2, NULL);
+            """)
 
-        XCTAssertNil(
-            try SQLiteCLIAccessor(processRunner: runner)
-                .queryValue(path: database.path, sql: "SELECT value FROM ItemTable LIMIT 1")
-        )
-        XCTAssertEqual(runner.callCount, 1)
-        XCTAssertTrue(runner.lastArguments.contains("-readonly"))
-    }
-
-    func testSQLiteQueryRetriesWithoutReadonlyWhenWALLocked() throws {
-        // A WAL-mode database under an active writer can refuse a readonly open (SQLITE_CANTOPEN
-        // 14, "unable to open database file"); the query must retry read-write so a live provider
-        // log (e.g. OpenCode's sqlite while its CLI is mid-write) never blocks a refresh.
-        let database = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OpenUsageTests.wallocked.\(UUID().uuidString).sqlite")
-        try Data().write(to: database)
-        defer { try? FileManager.default.removeItem(at: database) }
-        let runner = ReadOnlyFailingProcessRunner()
-
+        XCTAssertThrowsError(try sqlite.queryValue(path: path.path, sql: "DELETE FROM items RETURNING id"))
         XCTAssertEqual(
-            try SQLiteCLIAccessor(processRunner: runner)
-                .queryValue(path: database.path, sql: "SELECT 42"),
-            "42"
+            try sqlite.queryValue(path: path.path, sql: "SELECT id, value FROM items ORDER BY id"),
+            "1|example\n2|"
         )
-        XCTAssertEqual(runner.callCount, 2)
-        XCTAssertFalse(runner.lastArguments.contains("-readonly"))
-    }
-
-    func testSQLiteQueryCanKeepAntigravityConversationStoresReadOnly() throws {
-        let database = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OpenUsageTests.antigravity-readonly.\(UUID().uuidString).sqlite")
-        try Data().write(to: database)
-        defer { try? FileManager.default.removeItem(at: database) }
-        let runner = ReadOnlyFailingProcessRunner()
-
-        XCTAssertThrowsError(
-            try SQLiteCLIAccessor(processRunner: runner, allowsReadWriteFallback: false)
-                .queryValue(path: database.path, sql: "SELECT 42")
-        )
-        XCTAssertEqual(runner.callCount, 1, "Antigravity readers must not retry by opening the DB read-write")
-        XCTAssertTrue(runner.lastArguments.contains("-readonly"))
-    }
-
-    func testSQLiteExecuteKeepsCredentialSQLOffTheProcessArgumentList() throws {
-        let database = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OpenUsageTests.private-sql.\(UUID().uuidString).sqlite")
-        let secret = "cursor-access-secret-value"
-        let sql = "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('cursorAuth/accessToken', '\(secret)');"
-        let runner = InputCaptureProcessRunner()
-
-        try SQLiteCLIAccessor(processRunner: runner).execute(path: database.path, sql: sql)
-
-        XCTAssertFalse(runner.arguments.contains { $0.contains(secret) })
-        XCTAssertEqual(runner.arguments.last, database.path)
-        XCTAssertEqual(runner.input, Data(sql.utf8))
-    }
-}
-
-private final class InputCaptureProcessRunner: ProcessRunning, @unchecked Sendable {
-    private(set) var arguments: [String] = []
-    private(set) var input: Data?
-
-    func run(
-        executable: String,
-        arguments: [String],
-        environment: [String: String],
-        timeout: TimeInterval
-    ) throws -> ProcessResult {
-        self.arguments = arguments
-        input = nil
-        return ProcessResult(exitCode: 0, stdout: "", stderr: "")
-    }
-
-    func run(
-        executable: String,
-        arguments: [String],
-        environment: [String: String],
-        standardInput: Data?,
-        timeout: TimeInterval
-    ) throws -> ProcessResult {
-        self.arguments = arguments
-        input = standardInput
-        return ProcessResult(exitCode: 0, stdout: "", stderr: "")
     }
 }
 
@@ -321,46 +241,6 @@ final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
         {"token":{"access_token":"\(access)","refresh_token":"\(refresh)","expiry":"2000-01-01T00:00:00Z"}}
         """
         return "go-keyring-base64:" + Data(json.utf8).base64EncodedString()
-    }
-}
-
-private final class CredentialCountingProcessRunner: ProcessRunning, @unchecked Sendable {
-    private(set) var callCount = 0
-    private(set) var lastArguments: [String] = []
-
-    func run(
-        executable: String,
-        arguments: [String],
-        environment: [String: String],
-        timeout: TimeInterval
-    ) throws -> ProcessResult {
-        callCount += 1
-        lastArguments = arguments
-        return ProcessResult(exitCode: 0, stdout: "", stderr: "")
-    }
-}
-
-/// Fails the readonly attempt like a WAL-mode database under an active writer (SQLITE_CANTOPEN
-/// 14) and succeeds the read-write retry.
-private final class ReadOnlyFailingProcessRunner: ProcessRunning, @unchecked Sendable {
-    private(set) var callCount = 0
-    private(set) var lastArguments: [String] = []
-
-    func run(
-        executable: String,
-        arguments: [String],
-        environment: [String: String],
-        timeout: TimeInterval
-    ) throws -> ProcessResult {
-        callCount += 1
-        lastArguments = arguments
-        if arguments.contains("-readonly") {
-            return ProcessResult(
-                exitCode: 14, stdout: "",
-                stderr: "Error: in prepare, unable to open database file (14)"
-            )
-        }
-        return ProcessResult(exitCode: 0, stdout: "42", stderr: "")
     }
 }
 

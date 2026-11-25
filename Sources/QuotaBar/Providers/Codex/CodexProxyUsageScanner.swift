@@ -24,7 +24,7 @@ actor CodexProxyUsageScanner {
     private let optionalDefaultDatabasePath: String?
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(),
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
         homeDirectory: @escaping @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
         databasePaths: (@Sendable () -> [String])? = nil

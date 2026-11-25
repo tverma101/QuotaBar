@@ -3,10 +3,10 @@ name: Windows CI
 on:
   push:
     branches: [main]
-    paths: ['windows/**', '.github/workflows/windows-ci.yml']
+    paths: ['windows/**', 'Rust/quotabar-engine/**', 'Sources/QuotaBar/Resources/pricing_*.json', '.github/workflows/windows-ci.yml']
   pull_request:
     branches: [main]
-    paths: ['windows/**', '.github/workflows/windows-ci.yml']
+    paths: ['windows/**', 'Rust/quotabar-engine/**', 'Sources/QuotaBar/Resources/pricing_*.json', '.github/workflows/windows-ci.yml']
   workflow_dispatch:
 
 permissions:

@@ -46,7 +46,7 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
         // Local copy for the @Sendable closure — test cases are not Sendable.
         let dbPath: String = self.dbPath
         scanner = HermesUsageScanner(
-            sqlite: SQLiteCLIAccessor(),
+            sqlite: NativeSQLiteAccessor(),
             databasePaths: { [dbPath] },
             calendar: .current
         )

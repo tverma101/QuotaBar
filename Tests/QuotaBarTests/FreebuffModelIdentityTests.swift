@@ -158,7 +158,7 @@ final class FreebuffModelIdentityTests: XCTestCase {
             trash.waitUntilExit()
         }
         let path = directory.appendingPathComponent("history.db").path
-        let sqlite = SQLiteCLIAccessor()
+        let sqlite = NativeSQLiteAccessor()
         let timestamp = Int(now.addingTimeInterval(-60).timeIntervalSince1970 * 1_000)
         try sqlite.execute(path: path, sql: """
         CREATE TABLE threads(id TEXT, model TEXT, harness_id TEXT, world_snapshot TEXT);

@@ -687,7 +687,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
-        let index = try AntigravityStepTimestampIndex.load(path: fixture.paths[0], sqlite: SQLiteCLIAccessor())
+        let index = try AntigravityStepTimestampIndex.load(path: fixture.paths[0], sqlite: NativeSQLiteAccessor())
         let generation = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil)
         XCTAssertEqual(index.timestamp(for: generation), Int64(timestamp))
     }
@@ -1844,7 +1844,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: processData, as: UTF8.self))
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         let firstPayload = try XCTUnwrap(accessor.queryValue(
             path: fixture.paths[0],
             sql: AntigravityDbUsageScanner.dataSQL(after: -1)
@@ -1884,7 +1884,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: processData, as: UTF8.self))
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         let firstPayload = try XCTUnwrap(accessor.queryValue(
             path: fixture.paths[0],
             sql: AntigravityDbUsageScanner.dataSQL(after: -1, includeStepMetadata: true)
@@ -1910,7 +1910,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
 
     func testStepMetadataProbeRequiresASingleColumnIndexedKey() throws {
         let fixture = try makeDatabaseDirectory(fileNames: ["indexed.db", "unindexed.db", "composite.db"])
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         try accessor.execute(path: fixture.paths[0], sql: "CREATE TABLE steps(idx INTEGER PRIMARY KEY, metadata BLOB)")
         try accessor.execute(path: fixture.paths[1], sql: "CREATE TABLE steps(idx INTEGER, metadata BLOB)")
         try accessor.execute(

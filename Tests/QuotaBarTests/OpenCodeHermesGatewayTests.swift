@@ -71,7 +71,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
               ('null-tokens',  'm2',              \(now.timeIntervalSince1970 - 3600), 'opencode-go', 'https://opencode.ai/zen/go/v1', NULL, NULL, NULL, NULL, NULL, \(now.timeIntervalSince1970 - 1800));
             """)
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         guard let json = try accessor.queryValue(path: hermesDB, sql: OpenCodeUsageScanner.hermesGatewaySQL(cutoffSeconds: 0)) else {
             return XCTFail("expected a payload")
         }
@@ -130,7 +130,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         let dbPath: String = self.opencodeDB
         let hermesPath: String = self.hermesDB
         let scanner = OpenCodeUsageScanner(
-            sqlite: SQLiteCLIAccessor(),
+            sqlite: NativeSQLiteAccessor(),
             databasePaths: { [dbPath] },
             hermesStateDBPath: { hermesPath }
         )
@@ -163,7 +163,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         let hermesPath: String = self.hermesDB
         let opencodePath: String = self.opencodeDB
         let scanner = OpenCodeUsageScanner(
-            sqlite: SQLiteCLIAccessor(),
+            sqlite: NativeSQLiteAccessor(),
             databasePaths: { [opencodePath] },
             hermesStateDBPath: { hermesPath }
         )
@@ -260,7 +260,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             """)
         let dbPath: String = self.opencodeDB
         let scanner = OpenCodeUsageScanner(
-            sqlite: SQLiteCLIAccessor(),
+            sqlite: NativeSQLiteAccessor(),
             databasePaths: { [dbPath] },
             hermesStateDBPath: { nil }
         )

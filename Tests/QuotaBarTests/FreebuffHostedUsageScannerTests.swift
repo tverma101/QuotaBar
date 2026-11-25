@@ -396,7 +396,7 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             trash.waitUntilExit()
         }
         let db = directory.appendingPathComponent("history.db").path
-        let sqlite = SQLiteCLIAccessor()
+        let sqlite = NativeSQLiteAccessor()
         try sqlite.execute(path: db, sql: """
         CREATE TABLE threads(id TEXT, model TEXT, harness_id TEXT);
         CREATE TABLE messages(thread_id TEXT, seq INTEGER, request_id TEXT, ts INTEGER, metrics_json TEXT, role TEXT);
@@ -422,7 +422,7 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             trash.waitUntilExit()
         }
         let db = directory.appendingPathComponent("history.db").path
-        let sqlite = SQLiteCLIAccessor()
+        let sqlite = NativeSQLiteAccessor()
         try sqlite.execute(path: db, sql: """
         CREATE TABLE threads(id TEXT, model TEXT, harness_id TEXT);
         CREATE TABLE messages(thread_id TEXT, seq INTEGER, request_id TEXT, ts INTEGER, metrics_json TEXT, role TEXT);
