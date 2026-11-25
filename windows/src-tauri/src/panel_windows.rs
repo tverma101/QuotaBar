@@ -3,12 +3,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GW_OWNER, GetAncestor, GetMessageW,
-    GetWindow, MSG, OBJID_WINDOW, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    GetWindow, MSG, OBJID_WINDOW, SetForegroundWindow, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    PBT_APMRESUMEAUTOMATIC, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_NCDESTROY,
+    WM_POWERBROADCAST,
 };
 
 use crate::{popover_geometry, popover_platform};
@@ -20,6 +22,36 @@ static BLUR_TARGET: OnceLock<(AppHandle, usize)> = OnceLock::new();
 static LAST_BLUR_HIDE: Mutex<Option<Instant>> = Mutex::new(None);
 const TRAY_REOPEN_GUARD: Duration = Duration::from_millis(400);
 
+
+fn watch_power_resume(window: HWND, app: AppHandle) {
+    let context = Box::into_raw(Box::new(app));
+    let id = watch_power_resume as *const () as usize;
+    if unsafe { SetWindowSubclass(window, Some(power_broadcast), id, context as usize) } == 0 {
+        unsafe { drop(Box::from_raw(context)) };
+        log::warn!("Cannot register Windows power-resume handler");
+    }
+}
+
+unsafe extern "system" fn power_broadcast(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    context: usize,
+) -> LRESULT {
+    let app = context as *mut AppHandle;
+    if message == WM_NCDESTROY {
+        unsafe { RemoveWindowSubclass(window, Some(power_broadcast), id) };
+        unsafe { drop(Box::from_raw(app)) };
+    } else if message == WM_POWERBROADCAST && wparam == PBT_APMRESUMEAUTOMATIC as usize {
+        if let Err(error) = unsafe { &*app }.emit("refresh:power-resume", ()) {
+            log::warn!("Cannot notify QuotaBar about Windows power resume: {error}");
+        }
+    }
+    unsafe { DefSubclassProc(window, message, wparam, lparam) }
+}
+
 /// Show the panel anchored to the tray when possible.
 pub fn show_panel(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("main") {
@@ -29,6 +61,9 @@ pub fn show_panel(app_handle: &AppHandle) {
         }
         popover_platform::move_main_near_tray(app_handle);
         let _ = window.set_focus();
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe { SetForegroundWindow(hwnd.0 as HWND) };
+        }
     }
 }
 
@@ -203,6 +238,7 @@ pub fn init(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
         });
 
         if let Ok(hwnd) = window.hwnd() {
+            watch_power_resume(hwnd.0 as HWND, app_handle.clone());
             spawn_blur_watcher(app_handle.clone(), hwnd.0 as usize);
         }
     }

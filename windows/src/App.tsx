@@ -42,6 +42,7 @@ const TRAY_SETTINGS_DEBOUNCE_MS = 2000
 
 type ProviderAccountCredentialInput = {
   label?: string
+  registeredInstanceId?: string
   accessToken: string
   refreshToken: string
   sessionKey: string
@@ -368,7 +369,7 @@ function App() {
   const showOnboardingWizard = onboardingComplete === false && pluginSettings !== null
 
   const handleOnboardingComplete = useCallback(
-    (layout: UILayout) => {
+    (layout: UILayout, openSettings = true) => {
       void getVersion()
         .then((appVersion) =>
           Promise.all([saveUILayout(layout), saveDualUiOnboardingComplete(appVersion)])
@@ -376,7 +377,7 @@ function App() {
         .then(() => {
           setUILayout(layout)
           setOnboardingComplete(true)
-          setActiveView("settings")
+          if (openSettings) setActiveView("settings")
         })
         .catch((error) => {
           console.error("Failed to save onboarding completion:", error)
@@ -472,12 +473,12 @@ function App() {
       const base = pluginsMeta.find((plugin) => plugin.id === baseProviderId)
       if (!base) return
       const label = input.label?.trim() || "Account"
-      let instanceId = buildProviderInstanceId(baseProviderId, label)
+      let instanceId = input.registeredInstanceId ?? buildProviderInstanceId(baseProviderId, label)
       let counter = 2
-      while (
+      while (!input.registeredInstanceId && (
         pluginSettings.order.includes(instanceId) ||
         pluginSettings.providerInstances?.[instanceId]
-      ) {
+      )) {
         instanceId = `${buildProviderInstanceId(baseProviderId, label)}-${counter}`
         counter += 1
       }
@@ -507,7 +508,7 @@ function App() {
       void savePluginSettings(nextSettings).catch((error) => {
         console.error("Failed to save plugin settings for provider account:", error)
       })
-      void saveProviderAccountCredentials({
+      const saved = input.registeredInstanceId ? Promise.resolve() : saveProviderAccountCredentials({
         instanceId,
         baseProviderId,
         label,
@@ -515,6 +516,7 @@ function App() {
         refreshToken: input.refreshToken,
         sessionKey: input.sessionKey,
       })
+      void saved
         .then(() => {
           setLoadingForPlugins([instanceId])
           return startBatch([instanceId])
@@ -703,12 +705,7 @@ function App() {
   }
 
   if (uiLayout === "modern") {
-    return (
-      <ModernShell
-        {...shellProps}
-        preferWeeklyLimit={preferMenubarWeeklyLimit}
-      />
-    )
+    return <ModernShell {...shellProps} />
   }
 
   return (

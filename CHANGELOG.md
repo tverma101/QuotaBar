@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Windows
+
+- The Modern tray panel follows the macOS dashboard layout, with provider cards, expandable metrics, and a single Options menu. It opens by default for new profiles. Saved Classic choices carry forward.
+- Both layouts open without the insights banner. Modern has a separate Usage History screen with local spend estimates, token totals, and account breakdowns.
+- The tray panel sizes to its content, reopens the running instance, and offers a Hide From Screen Share setting.
+- Added Codex CLI account enrollment and opt-in automatic use of expiring Codex reset credits. Improved Windows provider discovery, pricing, and local usage accounting.
+- The per-user x64 installer bundles the QuotaBar CLI.
+
 ## v0.7.2-beta.1
 
 This beta ships the Windows x64 installer. The native macOS app is available to build from source at the same tag.

@@ -7,7 +7,8 @@
 - **Provider ID:** `opencode-go`
 - **Auth:** `~/.local/share/opencode/auth.json` (`opencode-go` entry `key`) or a Settings provider-account API key
 - **Account meters:** `GET https://opencode.ai/zen/go/v1/usage` (`Authorization: Bearer <key>`)
-- **Local fallback:** `~/.local/share/opencode/opencode.db` assistant `cost` rows (this machine only)
+- **Duplicate keys:** If local sign-in and one or more configured accounts use the same key, they share one meter request per refresh. Account labels stay intact, and local history is still counted only on the base card.
+- **Local fallback:** Assistant usage from every `opencode*.db` in `OPENCODE_DATA_DIR`, `XDG_DATA_HOME/opencode` or `~/.local/share/opencode` (in that order).
 
 ## Detection
 
@@ -21,6 +22,8 @@ The plugin enables when either:
 **With a key:** Session / Weekly / Monthly are **account-wide percents** from `/zen/go/v1/usage` (same numbers as the OpenCode dashboard), plus ISO `resetsAt`. Local SQLite is not used for those bars.
 
 **Without a key:** bars are observed local dollar spend vs published Go caps (`$12` / `$30` / `$60`), clamped at 100%.
+
+History includes Go and Zen turns from both OpenCode database layouts. Migrated turns with the same message ID count once. QuotaBar also projects reported Muse session usage from `~/.local/share/muse/sessions`, and OpenCode-billed Hermes sessions when Hermes is enabled. Unpriced turns still contribute tokens. Local history belongs to the main OpenCode card, not each configured key.
 
 ## API errors
 

@@ -64,6 +64,16 @@ jobs:
           }
           bun run tauri:build @buildArgs -- --locked
 
+      - name: Smoke-test Installation and Bundled CLI
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem target -Recurse -File -Filter '*-setup.exe' |
+            Where-Object { $_.DirectoryName -match '[\\/]bundle[\\/]nsis$' })
+          if ($installers.Count -ne 1) {
+            throw "Expected one x64 NSIS installer, found $($installers.Count)."
+          }
+          ./scripts/smoke-installer.ps1 -Installer $installers[0].FullName
+
       - name: Upload Windows QA Installer
         uses: actions/upload-artifact@v7
         with:

@@ -1,6 +1,5 @@
-use super::cache::{cache_state, enabled_snapshots_ordered};
-use quotabar_core::limits_export::{provider_limits_from_lines, LimitsDocument};
-use std::collections::BTreeMap;
+use super::cache::{cache_state, enabled_snapshots_ordered, read_plugin_selection};
+use quotabar_core::limits_export::{LimitsError, limits_from_snapshots};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -188,7 +187,7 @@ fn route(method: &str, path: &str, raw_path: &str) -> String {
     if let Some(provider_id) = path.strip_prefix("/v1/usage/") {
         if !provider_id.is_empty() && !provider_id.contains('/') {
             return match method {
-                "GET" => handle_get_usage_single(provider_id),
+                "GET" => handle_get_usage_single(provider_id, family_requested(raw_path)),
                 "OPTIONS" => response_no_content(),
                 _ => response_method_not_allowed(),
             };
@@ -197,7 +196,7 @@ fn route(method: &str, path: &str, raw_path: &str) -> String {
 
     if path == "/v1/limits" {
         return match method {
-            "GET" => handle_get_limits_collection(),
+            "GET" => handle_get_limits(None),
             "OPTIONS" => response_no_content(),
             _ => response_method_not_allowed(),
         };
@@ -206,7 +205,7 @@ fn route(method: &str, path: &str, raw_path: &str) -> String {
     if let Some(provider_id) = path.strip_prefix("/v1/limits/") {
         if !provider_id.is_empty() && !provider_id.contains('/') {
             return match method {
-                "GET" => handle_get_limits_single(provider_id),
+                "GET" => handle_get_limits(Some(provider_id)),
                 "OPTIONS" => response_no_content(),
                 _ => response_method_not_allowed(),
             };
@@ -324,12 +323,20 @@ fn handle_get_usage_collection() -> String {
     response_json(200, "OK", &body)
 }
 
-fn handle_get_usage_single(provider_id: &str) -> String {
-    let state = cache_state().lock().expect("cache state poisoned");
+fn family_requested(raw_path: &str) -> bool {
+    raw_path.split_once('?').is_some_and(|(_, query)| query.split('&').any(|item| item == "scope=family"))
+}
 
-    let is_known = state.known_plugin_ids.iter().any(|id| id == provider_id);
-    if !is_known {
+fn handle_get_usage_single(provider_id: &str, family: bool) -> String {
+    let state = cache_state().lock().expect("cache state poisoned");
+    let ids = read_plugin_selection(&state).matching_ids(&state.known_plugin_ids, Some(provider_id));
+    if ids.is_empty() || (!family && !ids.iter().any(|id| id == provider_id)) {
         return response_not_found("provider_not_found");
+    }
+    if family {
+        let snapshots = ids.iter().filter_map(|id| state.snapshots.get(id)).collect::<Vec<_>>();
+        let body = serde_json::to_string_pretty(&snapshots).unwrap_or_else(|_| "[]".to_string());
+        return response_json(200, "OK", &body);
     }
 
     match state.snapshots.get(provider_id) {
@@ -341,64 +348,19 @@ fn handle_get_usage_single(provider_id: &str) -> String {
     }
 }
 
-fn handle_get_limits_collection() -> String {
-    let snapshots = {
-        let state = cache_state().lock().expect("cache state poisoned");
-        enabled_snapshots_ordered(&state)
-    };
-    let mut providers = BTreeMap::new();
-    for snap in snapshots {
-        providers.insert(
-            snap.provider_id.clone(),
-            provider_limits_from_lines(
-                &snap.display_name,
-                snap.plan.as_deref(),
-                &snap.lines,
-                Some(&snap.fetched_at),
-                None,
-            ),
-        );
-    }
-    let doc = LimitsDocument {
-        schema: quotabar_core::limits_export::LIMITS_SCHEMA.to_string(),
-        providers,
-        errors: Vec::new(),
-    };
-    let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
-    response_json(200, "OK", &body)
-}
-
-fn handle_get_limits_single(provider_id: &str) -> String {
+fn handle_get_limits(provider_id: Option<&str>) -> String {
     let state = cache_state().lock().expect("cache state poisoned");
-
-    let is_known = state.known_plugin_ids.iter().any(|id| id == provider_id);
-    if !is_known {
+    let ids = read_plugin_selection(&state).matching_ids(&state.known_plugin_ids, provider_id);
+    if provider_id.is_some() && ids.is_empty() {
         return response_not_found("provider_not_found");
     }
-
-    match state.snapshots.get(provider_id) {
-        Some(snap) => {
-            let mut providers = BTreeMap::new();
-            providers.insert(
-                snap.provider_id.clone(),
-                provider_limits_from_lines(
-                    &snap.display_name,
-                    snap.plan.as_deref(),
-                    &snap.lines,
-                    Some(&snap.fetched_at),
-                    None,
-                ),
-            );
-            let doc = LimitsDocument {
-                schema: quotabar_core::limits_export::LIMITS_SCHEMA.to_string(),
-                providers,
-                errors: Vec::new(),
-            };
-            let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
-            response_json(200, "OK", &body)
-        }
-        None => response_no_content(),
-    }
+    let snapshots = ids.iter().filter_map(|id| state.snapshots.get(id));
+    let errors = ids.iter().filter(|id| state.failed_providers.contains(*id))
+        .map(|id| LimitsError { provider_id: id.clone(), message: "Last refresh failed.".into() })
+        .collect();
+    let doc = limits_from_snapshots(snapshots, errors, chrono::Utc::now());
+    let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+    response_json(200, "OK", &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +513,48 @@ mod tests {
         let resp = route("GET", "/v1/usage/claude", "/v1/usage/claude");
         assert!(resp.starts_with("HTTP/1.1 200"));
         assert!(resp.contains("fetchedAt"));
+    }
+
+    #[test]
+    #[serial]
+    fn family_limits_preserve_last_good_data_and_report_refresh_failures() {
+        let dir = std::env::temp_dir().join(format!("quotabar-api-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{
+            "plugins": {
+                "providerInstances": {
+                    "codex:work": { "baseProviderId": "codex", "label": "Work" },
+                    "codex:personal": { "baseProviderId": "codex", "label": "Personal" }
+                },
+                "disabled": ["codex:work"]
+            }
+        }"#).unwrap();
+        super::super::cache::init(&dir, vec!["codex".into()]);
+        cache_state().lock().unwrap().snapshots.insert(
+            "codex:work".to_string(), make_snapshot("codex:work", "Codex (Work)"),
+        );
+        super::super::cache::record_probe_failure("codex:work");
+        super::super::cache::record_probe_failure("codex:personal");
+
+        let legacy = route("GET", "/v1/usage/codex", "/v1/usage/codex");
+        assert!(legacy.starts_with("HTTP/1.1 204"));
+        let scoped = route("GET", "/v1/usage/codex", "/v1/usage/codex?scope=family");
+        assert_eq!(parse_body(&scoped)[0]["providerId"], "codex:work");
+        let family = route("GET", "/v1/limits/codex", "/v1/limits/codex");
+        let limits = parse_body(&family);
+        assert_eq!(limits["providers"]["codex:work"]["displayName"], "Codex (Work)");
+        assert_eq!(limits["errors"].as_array().unwrap().len(), 2);
+        let exact = route("GET", "/v1/limits/codex:personal", "/v1/limits/codex:personal");
+        let limits = parse_body(&exact);
+        assert!(limits["providers"].as_object().unwrap().is_empty());
+        assert_eq!(limits["errors"][0]["providerId"], "codex:personal");
+
+        super::super::cache::init(std::path::Path::new(""), vec![]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn parse_body(response: &str) -> serde_json::Value {
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
 
     #[test]

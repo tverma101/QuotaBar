@@ -16,7 +16,7 @@ OpenUsage does not use `api.devin.ai` for this provider. Devin's public API usag
 
 ## Auth Sources
 
-The plugin checks auth in this order:
+An explicitly saved account is used on its own. Otherwise, the plugin checks auth in this order:
 
 | Order | Source | Path / key |
 |---|---|---|
@@ -144,6 +144,8 @@ Response fields used:
 | `userStatus.planStatus.planInfo.hideDailyQuota` | Hide daily quota line when `true` |
 
 A present-but-unparsable weekly percentage is quota-unavailable (schema drift), not an exhausted window. Despite remaining-percent field names, tiles show percent **used** (`100 - remaining`).
+
+Expired or implausible reset timestamps are not shown. A positive weekly reset still identifies an exhausted window when the weekly percentage is omitted, even if that reset time is not shown.
 
 ## Plugin Strategy
 

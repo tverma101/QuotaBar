@@ -30,9 +30,8 @@ export function useProbeState({ onProbeResult }: UseProbeStateArgs) {
   )
 
   const getErrorMessage = useCallback((output: PluginOutput) => {
-    if (output.lines.length !== 1) return null
-    const line = output.lines[0]
-    if (line.type === "badge" && line.label === "Error") {
+    const line = output.lines.find((line) => line.type === "badge" && line.label === "Error")
+    if (line?.type === "badge") {
       return line.text || "Couldn't update data. Try again?"
     }
     return null
@@ -109,7 +108,7 @@ export function useProbeState({ onProbeResult }: UseProbeStateArgs) {
             data: errorMessage ? (existing?.data ?? null) : output,
             loading: false,
             error: errorMessage,
-            lastManualRefreshAt: !errorMessage && isManual
+            lastManualRefreshAt: isManual
               ? now
               : existing?.lastManualRefreshAt ?? null,
             lastUpdatedAt: errorMessage ? (existing?.lastUpdatedAt ?? null) : now,

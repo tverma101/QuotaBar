@@ -491,3 +491,12 @@ html.reduce-animations .motion-view {
   animation: none !important;
   translate: none !important;
 }
+
+/* Modern layout follows the macOS panel: no pointer glow behind the cards, no hover lift. */
+.app-panel-surface[data-ui-layout="modern"]::before {
+  display: none;
+}
+
+[data-ui-layout="modern"] .motion-card:hover {
+  transform: none;
+}

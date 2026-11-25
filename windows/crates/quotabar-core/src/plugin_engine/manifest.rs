@@ -70,7 +70,7 @@ pub fn load_plugins_from_dir(plugins_dir: &std::path::Path) -> Vec<LoadedPlugin>
     plugins
 }
 
-fn load_single_plugin(
+pub fn load_single_plugin(
     plugin_dir: &std::path::Path,
 ) -> Result<LoadedPlugin, Box<dyn std::error::Error>> {
     let manifest_path = plugin_dir.join("plugin.json");

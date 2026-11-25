@@ -16,6 +16,7 @@ name = "quotabar_lib"
 crate-type = ["rlib"]
 
 [build-dependencies]
+embed-resource = "3"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
@@ -55,6 +56,7 @@ window-vibrancy = "0.5"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_UI_Accessibility",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -38,6 +38,21 @@ points to the signed helper inside QuotaBar, so in-place app updates also update
 Exit codes are `0` for success, `2` for invalid arguments or an unknown provider, and `4` when a
 refresh or local read fails.
 
+## Windows
+
+The per-user installer includes `quotabar-cli.exe`. It does not change `PATH`.
+
+```powershell
+& "$env:LOCALAPPDATA\QuotaBar\quotabar-cli.exe" read codex
+& "$env:LOCALAPPDATA\QuotaBar\quotabar-cli.exe" read codex --force --diagnose
+```
+
+Omit the provider to read all enabled providers. On Windows, `read` reuses the tray app's
+fresh cache and refreshes missing or stale data in-process. It returns the last good snapshot
+when a refresh fails, with an error and a nonzero exit code. The tray app remains the only
+writer of the usage snapshot cache. Windows diagnostics (`quotabar.windows.diagnostics.v1`)
+include provider snapshots, freshness, warnings and errors.
+
 ## Backend Diagnostics
 
 `--diagnose` prints `quotabar.diagnostics.v1` JSON instead of scalar limits. The report contains
