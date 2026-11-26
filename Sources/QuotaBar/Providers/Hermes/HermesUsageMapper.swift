@@ -10,7 +10,7 @@ enum HermesUsageMapper {
     static let sourceNote = "From your Hermes state database"
 
     /// Models above this count fold into "Other" (mirrors the spend tiles' `namedModelCap`).
-    private static let namedModelCap = 5
+    private static let namedModelCap = 3
 
     static func lines(scan: HermesUsageScan, now: Date) -> [MetricLine] {
         var lines: [MetricLine] = []
@@ -78,24 +78,39 @@ enum HermesUsageMapper {
 
         var named: [ModelUsageEntry] = []
         var otherTokens = 0
+        var otherSaturated = false
         var otherCost: Double?
+        var otherCostOverflowed = false
         var otherModels: [ModelUsageVariant] = []
         var otherHasPartial = false
+        // Same fold policy as the spend tiles (Unattributed always folds; an unpriced tail model
+        // folds unless its token volume is material — tenth of the leader's, ≥10M outright), though
+        // Hermes ranks named rows by tokens while spend tiles rank by cost first.
+        let unpricedTokenFloor = max((models.first?.tokens ?? 0) / 10, 10_000_000)
 
         for model in models {
             let name = model.model.nilIfEmpty ?? ModelUsageEntry.unattributedModelName
+            let isUnattributed = name.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
+            let unpricedHeavyweight = model.costUSD == nil && model.tokens >= unpricedTokenFloor
             let entry = ModelUsageEntry(
                 model: name,
                 totalTokens: model.tokens,
                 costUSD: model.costUSD,
                 costIsComplete: model.isPartial ? false : nil
             )
-            if named.count < namedModelCap {
-                named.append(entry)
-            } else {
+            if isUnattributed || (named.count >= namedModelCap && !unpricedHeavyweight) {
+                if model.tokens > 0 && otherTokens > Int.max - model.tokens { otherSaturated = true }
                 otherTokens = ProviderParse.addingSaturating(otherTokens, model.tokens)
-                if let cost = model.costUSD {
-                    otherCost = (otherCost ?? 0) + cost
+                // Same cost policy as the spend-tile accumulator: a non-finite or overflowing
+                // dollar sum stops being a total at all and marks Other incomplete instead of
+                // rendering a clipped number.
+                if let cost = model.costUSD, !otherCostOverflowed {
+                    if cost.isFinite, cost >= 0, ((otherCost ?? 0) + cost).isFinite {
+                        otherCost = (otherCost ?? 0) + cost
+                    } else {
+                        otherCostOverflowed = true
+                        otherHasPartial = true
+                    }
                 }
                 otherModels.append(ModelUsageVariant(
                     model: name,
@@ -103,7 +118,11 @@ enum HermesUsageMapper {
                     costUSD: model.costUSD,
                     costIsComplete: model.isPartial ? false : nil
                 ))
-                otherHasPartial = otherHasPartial || model.isPartial
+                // A folded unpriced model leaves Other's dollar total a lower bound, same as a
+                // partially-priced one — the collapsed row must not read as a complete spend.
+                otherHasPartial = otherHasPartial || model.isPartial || (model.costUSD == nil && model.tokens > 0)
+            } else {
+                named.append(entry)
             }
         }
         if otherTokens > 0 || (otherCost ?? 0) > 0 {
@@ -112,7 +131,8 @@ enum HermesUsageMapper {
                 totalTokens: otherTokens,
                 costUSD: otherCost,
                 variants: otherModels,
-                costIsComplete: otherHasPartial ? false : nil
+                costIsComplete: otherHasPartial ? false : nil,
+                tokenCountSaturated: otherSaturated ? true : nil
             ).presentedRows())
         }
         guard !named.isEmpty else { return nil }

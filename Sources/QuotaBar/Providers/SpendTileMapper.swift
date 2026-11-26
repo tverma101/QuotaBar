@@ -411,7 +411,9 @@ enum SpendTileMapper {
         return values
     }
 
-    private static let namedModelCap = 5
+    /// The popover names only the leading models; everything past the cap folds into Other's
+    /// expandable contributors — a wall of tail rows is the same noise as a stack of slivers.
+    private static let namedModelCap = 3
 
     /// Tracks the casings seen for one case-folded name and elects the one that carried the most
     /// tokens (ties prefer the all-lowercase spelling, then alphabetical) — so `GLM-5.2` and `glm-5.2`
@@ -640,43 +642,27 @@ enum SpendTileMapper {
         return trimmed.isEmpty ? ModelUsageEntry.unattributedModelName : trimmed
     }
 
-    /// Models below this share of the period fold into Other — a stack of sub-5% slivers is noise,
-    /// and the Other row lists its leading contributors.
-    private static let minVisibleShare = 0.05
-
+    /// The entries arrive spend-ranked (priced dollars first, then unpriced by tokens), so the
+    /// first `namedModelCap` are the rows worth a full row each. Past the cap, priced slivers and
+    /// low-volume unpriced models fold into Other's expandable contributors. An unpriced model
+    /// escapes the fold only when its token volume is genuinely material — a tenth of the
+    /// leader's tokens and ten million outright — so heavy custom models stay visible without
+    /// stretching the popover into a wall of tail rows.
     private static func foldModelList(_ entries: [ModelUsageEntry]) -> [ModelUsageEntry] {
-        let spendShares = ModelSpendShares(entries)
-        let tokenTotal = entries.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
-        func tokenShareLeader(_ entry: ModelUsageEntry) -> Bool {
-            guard tokenTotal > 0 else { return false }
-            return Double(entry.totalTokens) / Double(tokenTotal) >= minVisibleShare
-        }
-
         var visible: [ModelUsageEntry] = []
         var other = ModelAccumulator()
-        var namedCount = 0
+        let unpricedTokenFloor = max((entries.first?.totalTokens ?? 0) / 10, 10_000_000)
 
         for entry in entries {
             // Tokens the logs couldn't tie to a model (Grok) read as noise under their own
             // "Unattributed" row — the panel is an insight, not an accounting ledger, so they just
             // count into Other however large they are.
             let isUnattributed = entry.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
-            if isUnattributed {
+            let unpricedHeavyweight = entry.costUSD == nil && entry.totalTokens >= unpricedTokenFloor
+            if isUnattributed || (visible.count >= namedModelCap && !unpricedHeavyweight) {
                 other.fold(entry)
-            } else if (spendShares?.share(of: entry) ?? 0) < minVisibleShare && !tokenShareLeader(entry) {
-                other.fold(entry)
-            } else if entry.costUSD == nil {
-                visible.append(entry)
-                namedCount += 1
-            } else if tokenShareLeader(entry) {
-                // A substantial token consumer stays named regardless of cost share, without
-                // spending a paid-model slot — its usage must stay identifiable.
-                visible.append(entry)
-            } else if namedCount < namedModelCap {
-                visible.append(entry)
-                namedCount += 1
             } else {
-                other.fold(entry)
+                visible.append(entry)
             }
         }
 
