@@ -1,0 +1,92 @@
+import XCTest
+@testable import QuotaBar
+
+/// A failed or cancelled Freebuff run never produced a complete usage receipt by design, and the
+/// API's `import-` runs are imported legacy history with no token metrics. Those days stay honest
+/// lower bounds (`partialDays`) but must not raise the provider's actionable "missing receipt"
+/// warning every cycle for a month. A completed live run that lost its receipt, or a run that
+/// reported incomplete usage, is a genuine gap and keeps warning.
+final class FreebuffExplainedGapTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func receipt(id: String, status: String?, metrics: String) -> FreebuffUsageReceipt {
+        FreebuffUsageReceipt(
+            id: id,
+            timestampMs: now.addingTimeInterval(-60).timeIntervalSince1970 * 1000,
+            metricsJSON: metrics,
+            model: "vendor/model",
+            runStatus: status
+        )
+    }
+
+    private func scan(_ receipts: [FreebuffUsageReceipt]) async throws -> FreebuffDesktopUsageScanner.Scan {
+        let scanner = FreebuffDesktopUsageScanner(databasePaths: { [] })
+        let result = try await scanner.scan(now: now, hostedReceipts: receipts)
+        return try XCTUnwrap(result)
+    }
+
+    func testFailedAndCancelledRunsWithoutUsageAreExplainedLowerBounds() async throws {
+        for status in ["failed", "cancelled"] {
+            let result = try await scan([receipt(id: "cloud:run-1", status: status, metrics: "{}")])
+            let day = DailyUsageAccumulator.dayKey(from: now)
+            XCTAssertEqual(result.partialDays, [day], "the day stays a lower bound")
+            XCTAssertTrue(result.unexplainedPartialDays.isEmpty,
+                          "a \(status) run never had a complete receipt by design — no actionable warning")
+            XCTAssertTrue(result.usage.series.daily.isEmpty, "no usage is never manufactured into a measured zero")
+        }
+    }
+
+    func testImportedLegacyHistoryWithoutUsageIsExplained() async throws {
+        // The hosted scanner prefixes every receipt id with "cloud:", so an imported run arrives as
+        // "cloud:import-…" — it must still be explained, not treated as a live completed gap.
+        for id in ["import-abc123", "cloud:import-abc123"] {
+            let result = try await scan([receipt(id: id, status: "completed", metrics: "{}")])
+            XCTAssertEqual(result.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
+            XCTAssertTrue(result.unexplainedPartialDays.isEmpty, "imported legacy history carries no metrics by design (\(id))")
+        }
+    }
+
+    func testCompletedLiveRunMissingItsReceiptStillWarns() async throws {
+        let result = try await scan([receipt(id: "cloud:run-1", status: "completed", metrics: "{}")])
+        let day = DailyUsageAccumulator.dayKey(from: now)
+        XCTAssertEqual(result.partialDays, [day])
+        XCTAssertEqual(result.unexplainedPartialDays, [day], "a completed live run that lost its receipt is a real gap")
+    }
+
+    func testCompletedHostedRunIncompleteUsageStillWarns() async throws {
+        let metrics = #"{"usage":{"inputTokens":100,"outputTokens":50},"usageIncomplete":true}"#
+        let result = try await scan([receipt(id: "cloud:run-1", status: "completed", metrics: metrics)])
+        let day = DailyUsageAccumulator.dayKey(from: now)
+        XCTAssertEqual(result.partialDays, [day])
+        XCTAssertEqual(result.unexplainedPartialDays, [day], "a completed live run's partial measurement is actionable")
+    }
+
+    func testFailedRunIncompleteUsageIsExplained() async throws {
+        let metrics = #"{"usage":{"inputTokens":100,"outputTokens":50},"usageIncomplete":true}"#
+        let result = try await scan([receipt(id: "cloud:run-1", status: "failed", metrics: metrics)])
+        XCTAssertEqual(result.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
+        XCTAssertTrue(result.unexplainedPartialDays.isEmpty, "a terminal failed run's partial usage is a permanent fact")
+    }
+
+    func testLocalDesktopNoUsageAndIncompleteTurnsAreExplained() async throws {
+        // Local Desktop turns carry no run status; their ids are <thread>:<seq>, not cloud:. The SDK
+        // stamps no-usage / usageIncomplete on abort/interrupt/provider-not-reporting — permanent local
+        // facts, not retry-recoverable gaps, so they stay lower bounds without the warning.
+        let noUsage = receipt(id: "thread-1:4", status: nil, metrics: "{}")
+        let incomplete = receipt(
+            id: "thread-1:5", status: nil,
+            metrics: #"{"usage":{"inputTokens":100,"outputTokens":50},"usageIncomplete":true}"#
+        )
+        let result = try await scan([noUsage, incomplete])
+        XCTAssertEqual(result.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
+        XCTAssertTrue(result.unexplainedPartialDays.isEmpty, "local abort/interrupt facts are explained gaps")
+    }
+
+    func testFullyMeasuredReceiptIsNeitherPartialNorUnexplained() async throws {
+        let metrics = #"{"usage":{"inputTokens":100,"outputTokens":50}}"#
+        let result = try await scan([receipt(id: "cloud:run-1", status: "completed", metrics: metrics)])
+        XCTAssertTrue(result.partialDays.isEmpty)
+        XCTAssertTrue(result.unexplainedPartialDays.isEmpty)
+        XCTAssertEqual(result.usage.series.daily.first?.totalTokens, 150)
+    }
+}

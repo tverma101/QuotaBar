@@ -12,19 +12,23 @@ do the hot accounting work — today, the per-line parsers behind the Claude and
 folds — without Foundation's overhead per line: JSONSerialization dictionary materialization,
 `Data` copies, and per-call formatting. Measured on a 20,000-line synthetic corpus: the Rust path
 uses roughly **10x less CPU** for the Claude parse (**~4.6x** for the Codex rollout parser) — run
-it yourself with the benchmarks below.
+it yourself with the benchmarks below. The Claude line parser deserializes only the fields it
+reads into borrowed, zero-copy values (the rest of the line — file contents, tool output — is
+skipped at scan speed), and benches ~1.75x faster than the whole-line `serde_json::Value` port it
+replaced on a real 30 MB corpus of recent usage lines (8,000 lines), with byte-identical entries.
 
 QuotaBar shares none of this behavior change: the Rust parser is a line-for-line port of the
 Swift reference implementation, and the two are tested against each other.
 
 ## Layout
 
-- `Rust/quotabar-core/` — the crate (edition 2021, `staticlib` + `rlib`). Only dependency:
-  `serde_json`, the vetted parser used rather than a hand-rolled one; it is the minimum needed to
-  deserialize usage lines and nothing else. New crate dependencies need the usual justification
-  from AGENTS.md.
+- `Rust/quotabar-core/` — the crate (edition 2021, `staticlib` + `rlib`). Dependencies:
+  `serde_json` (with `raw_value`), `serde` derive, and `memchr` — all already in the lock graph,
+  all there to keep the line scan zero-copy; no other new dependencies without the usual
+  justification from AGENTS.md.
 - `Sources/CQuotabarCore/` — a clang target whose header (`include/quotabar_core.h`) declares the
-  C ABI the Swift code imports. The `.c` shim is a link probe.
+  C/Rust ABI the Swift code imports: the parser entry points, the compact pricing-catalog codec,
+  and `qb_find_byte`, a memchr-backed byte search the JSONL reader uses for newline scanning.
 - `Sources/QuotaBar/Support/ClaudeUsageLineRustParser.swift` — the Claude bridge. Maps the FFI
   result onto `ClaudeLogUsageScanner.Entry`, or returns nil.
 - `Sources/QuotaBar/Support/CodexRolloutRustParser.swift` — the Codex bridge. Stateful across one
@@ -53,6 +57,14 @@ The bridge can return nil, and production then runs the Swift path, **never a di
 For Codex the scope is **one whole file, not one line**: the engine is stateful across the file's
 lines (running model, fast-tier flags, the child-session replay gate), so a line it cannot emulate
 makes the entire file re-parse with the Swift engine. Mixing engines within a file is never done.
+
+The Claude parser runs a **borrowed typed fast path** before that fallback: a `TypedLine<'a>`
+deserializes only the fields the parser reads (strings as zero-copy `&'a str`, ambiguous tokens as
+a `RawField` tri-state distinguishing absent from present-null from present-value, `usage` as a
+`Map<String, Value>` small enough to keep exact). Lines with JSON escapes in any watched string, or
+in shapes the typed model cannot express, drop into the `Value` implementation with byte-for-byte
+the pre-typed result. `is_sidechain`/`version`/`requestId`-style literal `null` is treated as an
+error there exactly as the reference does — `Option<Box<RawValue>>` alone would swallow it.
 
 Everything else — invalid JSON, non-object JSON, malformed tokens, advisor iterations, SemVer
 rules, leap-second calendar math — is implemented identically in both paths and pinned by the

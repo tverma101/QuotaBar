@@ -6,10 +6,14 @@ struct FreebuffUsageReceipt: Codable, Equatable, Sendable {
     var timestampMs: Double
     var metricsJSON: String
     var model: String?
+    /// The hosted run's terminal status (`completed` / `failed` / `cancelled`), when known. A run that
+    /// failed or was cancelled never produced a complete usage receipt by design — that is an explained
+    /// gap, not an actionable pricing failure. Optional so older cached receipts decode as `nil`.
+    var runStatus: String?
 
     var scannerRow: [String: Any] {
         ["id": id, "timestamp": String(timestampMs), "metrics": metricsJSON,
-         "selectedModel": model ?? ""]
+         "selectedModel": model ?? "", "runStatus": runStatus ?? ""]
     }
 }
 

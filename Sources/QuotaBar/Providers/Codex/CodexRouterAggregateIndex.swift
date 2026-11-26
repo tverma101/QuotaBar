@@ -14,7 +14,9 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
     /// catalogue change that cannot touch the fold's numbers no longer costs a full ledger read.
     /// Also bump this when hardcoded Codex pricing rules change; catalogue dependencies cover rates,
     /// identities and dated resolution, rather than every implementation detail of the cost formula.
-    static let schema = 15
+    /// v16 gates unmeasured-day flagging on a response-start marker, so native image/search passthrough
+    /// rows no longer flag the day; old aggregates must re-fold to drop those false partial days.
+    static let schema = 16
     static let maxResidentRecords = 32
 
     struct Key: Codable, Equatable, Sendable {

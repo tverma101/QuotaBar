@@ -9,6 +9,10 @@ actor FreebuffDesktopUsageScanner {
     struct Scan: Sendable {
         var usage: LogUsageScan
         var partialDays: Set<String>
+        /// The subset of `partialDays` whose gap is actionable (a completed live run with a missing or
+        /// incomplete receipt). Failed/cancelled runs and imported legacy history stay lower bounds in
+        /// `partialDays` but are explained — they must not raise the provider's missing-receipt warning.
+        var unexplainedPartialDays: Set<String> = []
     }
 
     struct Revision: Codable, Equatable {
@@ -68,6 +72,18 @@ actor FreebuffDesktopUsageScanner {
         /// Whether the model came from the receipt rather than the thread's saved selection.
         var fromReceipt: Bool
         var partial: Bool
+        /// The hosted run's terminal status, when known. Optional so older persisted turns decode.
+        var runStatus: String?
+
+        /// A partial turn is an actionable gap only when a hosted COMPLETED live run lost or incompletely
+        /// reported its receipt (a retry might still recover it). Failed/cancelled runs, imported legacy
+        /// history, and local Desktop turns (abort/interrupt/no-metrics facts the SDK never retries) are
+        /// explained: the day stays an honest lower bound but raises no warning.
+        var isUnexplainedPartial: Bool {
+            guard partial, runStatus == "completed", id.hasPrefix("cloud:") else { return false }
+            // Imported legacy history arrives as `cloud:import-…` and carries no token metrics by design.
+            return !id.hasPrefix("cloud:import-") && !id.hasPrefix("import-")
+        }
     }
 
     /// The counts of one receipt. `invalid` keeps "the field was there but was not a number" apart
@@ -276,6 +292,7 @@ actor FreebuffDesktopUsageScanner {
         }
         var accumulator = DailyUsageAccumulator()
         var partialDays: Set<String> = []
+        var unexplainedPartialDays: Set<String> = []
         var seen: Set<String> = []
         var nextFutureTimestamp: Date?
         for databaseTurns in turnsByDatabase {
@@ -289,7 +306,10 @@ actor FreebuffDesktopUsageScanner {
                 }
                 let day = DailyUsageAccumulator.dayKey(from: date, calendar: calendar)
                 guard let usage = turn.usage else {
-                    if turn.partial { partialDays.insert(day) }
+                    if turn.partial {
+                        partialDays.insert(day)
+                        if turn.isUnexplainedPartial { unexplainedPartialDays.insert(day) }
+                    }
                     continue
                 }
                 // A hosted placeholder must not hide a measured older Desktop copy.
@@ -345,7 +365,10 @@ actor FreebuffDesktopUsageScanner {
                     // not an unknown model. Tokens count; no warning triangle.
                     accumulator.addNamedUnpricedModel(day: day, model: model)
                 }
-                if turn.partial { partialDays.insert(day) }
+                if turn.partial {
+                    partialDays.insert(day)
+                    if turn.isUnexplainedPartial { unexplainedPartialDays.insert(day) }
+                }
             }
         }
         if unreadableRows > 0 {
@@ -364,7 +387,7 @@ actor FreebuffDesktopUsageScanner {
                 }
             }
         }
-        let result = Scan(usage: accumulator.build(), partialDays: partialDays)
+        let result = Scan(usage: accumulator.build(), partialDays: partialDays, unexplainedPartialDays: unexplainedPartialDays)
         if snapshotStable, Self.fitsCachedScanBudget(result) {
             cachedScan = CachedScan(
                 databases: databaseSnapshots,
@@ -652,7 +675,8 @@ actor FreebuffDesktopUsageScanner {
             usage: nil,
             savedModel: savedModel,
             fromReceipt: recordedModel != nil,
-            partial: usage == nil || metrics["usageIncomplete"] as? Bool == true
+            partial: usage == nil || metrics["usageIncomplete"] as? Bool == true,
+            runStatus: text(row["runStatus"]).nilIfEmpty
         )
         if let usage {
             derived.usage = .counts(

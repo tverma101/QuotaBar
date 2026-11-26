@@ -185,7 +185,7 @@ final class FreebuffProvider: ProviderRuntime {
                 let usage = scan.usage
                 let firstDay = DailyUsageAccumulator.dayKey(from: Calendar.current.date(byAdding: .day, value: -29, to: scanNow)!)
                 let today = DailyUsageAccumulator.dayKey(from: scanNow)
-                if scan.partialDays.contains(where: { $0 >= firstDay && $0 <= today }) {
+                if scan.unexplainedPartialDays.contains(where: { $0 >= firstDay && $0 <= today }) {
                     DiagnosticGate.logOnce(for: "auth.freebuff.history.missing-receipts") {
                         AppLog.warn(LogTag.auth("freebuff"), "token history contains incomplete or missing usage receipts")
                     }

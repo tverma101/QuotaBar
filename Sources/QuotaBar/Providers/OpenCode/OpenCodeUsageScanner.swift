@@ -543,6 +543,13 @@ struct OpenCodeUsageScanner: Sendable {
                         AppLog.info(.refresh, "opencode database \(path) uses the \(layout) layout")
                     }
                 }
+                let memoKey = Self.sqliteRowsMemoKey(path: path, schema: schema, cutoffMs: cutoffMs)
+                if let memoKey, let memoRows = Self.cachedSqliteRows(key: memoKey) {
+                    // The database did not change since the last pass: reuse the parsed rows
+                    // (the query and the giant json_group_array payload dominate this stage).
+                    rows.append(contentsOf: memoRows)
+                    continue
+                }
                 guard let json = try JSONLAccountingWorkPacer.shared.perform({
                     try sqlite.queryValue(
                         path: path,
@@ -558,6 +565,9 @@ struct OpenCodeUsageScanner: Sendable {
                 }) else {
                     failures[path] = "usage rows contain malformed accounting values"
                     continue
+                }
+                if let memoKey {
+                    Self.storeSqliteRows(key: memoKey, rows: parsedRows)
                 }
                 rows.append(contentsOf: parsedRows)
             } catch {
@@ -1555,6 +1565,34 @@ struct OpenCodeUsageScanner: Sendable {
         var tokenCountSaturated: Bool
         var model: String
         var providerID: String
+    }
+
+    /// One entry per database path: the rows last parsed for a (path, schema, cutoff, revision)
+    /// stamp. Idle databases (the common panel-open case) then skip the query and the JSON parse
+    /// entirely; a new revision replaces the prior entry for that path. Process-lifetime memo,
+    /// like the monthly-cycle anchor memo below.
+    private static let sqliteRowsMemo = OSAllocatedUnfairLock<[String: [Row]]>(initialState: [:])
+
+    private static func sqliteRowsMemoKey(path: String, schema: OpenCodeDatabaseSchema, cutoffMs: Int) -> String? {
+        guard let revision = OpenCodeDatabaseSchemaProbe.revisionStamp(path: path) else { return nil }
+        // The layout is part of the key: the row source differs per layout, so a store that
+        // migrates under the same file stamp cannot reuse the other layout's rows.
+        return "\(path)|\(schema)|\(cutoffMs)|\(revision)"
+    }
+
+    private static func cachedSqliteRows(key: String) -> [Row]? {
+        sqliteRowsMemo.withLock { $0[key] }
+    }
+
+    private static func storeSqliteRows(key: String, rows: [Row]) {
+        // Keep at most one revision per path: the key starts with the path, so drop stale ones.
+        let prefix = key.split(separator: "|").first.map { "\($0)|" } ?? key
+        sqliteRowsMemo.withLock { cache in
+            for cacheKey in cache.keys where cacheKey.hasPrefix(prefix) {
+                cache.removeValue(forKey: cacheKey)
+            }
+            cache[key] = rows
+        }
     }
 
     /// Parse the `json_group_array(json_array(...))` payload: an array of

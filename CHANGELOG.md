@@ -85,6 +85,7 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 - Make Freebuff's signed-out warning actionable with the local CLI login command and a refresh step.
 - Restore Antigravity history for newer conversation databases by reading timestamps from correlated step metadata.
 - Reuse a Keychain prompt that is already on screen for the same item instead of probing the item again: sibling cards wait for that one dialog and retry silently from its grant, and a newer explicit refresh still fails closed rather than waiting behind the prompt it superseded.
+- Speed up the local-log accounting folds: the Claude Rust parser now deserializes only the fields it reads (borrowed, zero-copy; escapes and exotic shapes fall back to the exact previous implementation), newline scanning on the JSONL reader uses platform-vectorized memchr, and the Codex byte-marker gate is SIMD-accelerated.
 - Keep freshly fetched OpenCode Go meters when the panel's second (history) pass fails its local scan — a fold-only pass never asks the account endpoint, so it has no evidence that those meters are stale.
 - Clear the catch-all provider failure once any later pass succeeds, so a provider whose scopes all resolve to that bucket does not keep an error row and a Retry affordance forever.
 - Fail the whole OpenCode fold closed when Hermes can't be read, instead of publishing the readable subset as if it were the complete card.

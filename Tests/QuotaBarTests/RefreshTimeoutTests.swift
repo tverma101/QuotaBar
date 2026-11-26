@@ -89,10 +89,15 @@ final class RefreshTimeoutTests: XCTestCase {
         runtime: ProviderRuntime,
         timeout: TimeInterval
     ) -> WidgetDataStore {
-        WidgetDataStore(
+        // The snapshot cache defaults to `UserDefaults.standard`, which every parallel xctest
+        // process shares; another process's refresh of provider "test" then fenced this one off as a
+        // superseded cross-process request (`.skipped`). Keep the cache in the isolated suite too.
+        let defaults = makeUserDefaults("refresh-timeout")
+        return WidgetDataStore(
             registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
             providers: [runtime],
-            defaults: makeUserDefaults("refresh-timeout"),
+            cache: ProviderSnapshotCache(userDefaults: defaults),
+            defaults: defaults,
             providerRefreshTimeout: timeout
         )
     }
