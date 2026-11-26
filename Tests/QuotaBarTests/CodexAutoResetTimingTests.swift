@@ -90,7 +90,7 @@ final class CodexAutoResetTimingTests: XCTestCase {
 
     func testObservedDeadlineSurvivesAnOfflineRestart() async {
         let store = defaults()
-        let credit = CodexResetCredit(id: "known", expiresAt: base.addingTimeInterval(90))
+        let credit = CodexResetCredit(id: "known", expiresAt: base.addingTimeInterval(400))
         let first = CodexAutoResetCoordinator(accounts: ["codex": .init(
             availableCredits: { [credit] }, claim: { _, _, _ in XCTFail("too early"); return .failed }
         )], defaults: store, now: { self.base }, verifiedAccountIdentityByProviderID: ["codex": "owner"])
@@ -98,15 +98,15 @@ final class CodexAutoResetTimingTests: XCTestCase {
         let restarted = CodexAutoResetCoordinator(accounts: ["codex": .init(
             availableCredits: { nil }, claim: { _, _, _ in XCTFail("no live validation"); return .failed }
         )], defaults: store, now: { self.base }, verifiedAccountIdentityByProviderID: ["codex": "owner"])
-        XCTAssertEqual(restarted.status(for: "codex", enabled: true), .scheduled(credit.expiresAt.addingTimeInterval(-60)))
+        XCTAssertEqual(restarted.status(for: "codex", enabled: true), .scheduled(credit.expiresAt.addingTimeInterval(-300)))
         let delay = await restarted.runOnce(for: "codex")
-        XCTAssertEqual(delay, 10)
+        XCTAssertEqual(delay, 15)
     }
 
     func testPassingAnObservedWindowIsVisibleAndNeverPostsAfterExpiry() async {
         let store = defaults()
         var now = base
-        var credits = [CodexResetCredit(id: "known", expiresAt: base.addingTimeInterval(90))]
+        var credits = [CodexResetCredit(id: "known", expiresAt: base.addingTimeInterval(400))]
         var writes = 0
         let account = CodexAutoResetCoordinator.Account(
             availableCredits: { credits }, claim: { _, _, _ in writes += 1; return .success }
@@ -114,7 +114,7 @@ final class CodexAutoResetTimingTests: XCTestCase {
         let first = CodexAutoResetCoordinator(accounts: ["codex": account], defaults: store,
             now: { now }, verifiedAccountIdentityByProviderID: ["codex": "owner"])
         await first.runOnce(for: "codex")
-        now = base.addingTimeInterval(100)
+        now = base.addingTimeInterval(410)
         credits = []
         await first.runOnce(for: "codex")
         XCTAssertEqual(first.status(for: "codex", enabled: true), .windowPassed(nextAttempt: nil))
@@ -127,7 +127,7 @@ final class CodexAutoResetTimingTests: XCTestCase {
 
     func testLiveDeadlineUpdatesReplaceUnsentCachedExpiry() async {
         let store = defaults()
-        var expiry = base.addingTimeInterval(90)
+        var expiry = base.addingTimeInterval(400)
         let account = CodexAutoResetCoordinator.Account(
             availableCredits: { [.init(id: "same", expiresAt: expiry)] },
             claim: { _, _, _ in XCTFail("too early"); return .failed }
@@ -137,7 +137,7 @@ final class CodexAutoResetTimingTests: XCTestCase {
         expiry = base.addingTimeInterval(600)
         await subject.runOnce(for: "codex")
         let restarted = CodexAutoResetCoordinator(accounts: ["codex": account], defaults: store, now: { self.base })
-        XCTAssertEqual(restarted.status(for: "codex", enabled: true), .scheduled(expiry.addingTimeInterval(-60)))
+        XCTAssertEqual(restarted.status(for: "codex", enabled: true), .scheduled(expiry.addingTimeInterval(-300)))
     }
 
     func testExpiryIsRecheckedBeforeEachSameAccountCredentialFallback() async {

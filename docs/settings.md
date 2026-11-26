@@ -41,7 +41,7 @@ time; it also reports unavailable iCloud, loading, write, and malformed-file sta
 |---|---|---|
 | Show Usage As | Used / Left | Whether bounded metrics read "48% used" or "52% left" — same toggle as clicking a headline. |
 | Reset Times | Countdown / Exact time | "Resets in 3h 25m" vs "Resets today at 6:38 PM" — same toggle as clicking a reset label. |
-| Auto-Use Expiring Codex Resets | Off | Redeem eligible Codex credits one minute before expiry for verified connected accounts. The Mac must be awake and QuotaBar running; see [auto-use behavior](codex-auto-reset.md). |
+| Auto-Use Expiring Codex Resets | Off | Redeem eligible Codex credits five minutes before expiry for verified connected accounts. The Mac must be awake and QuotaBar running; see [auto-use behavior](codex-auto-reset.md). |
 | Always Show Pacing | Off / On | Off (default) shows pacing only when a metric is close to or over its limit. On surfaces it on every metric with a reset window: on-track rows gain their projection ("~33% left at reset") and an even-pace tick marking where steady use would put you right now. Metrics without a reset window have no pace to show. |
 
 ## Spend Periods
@@ -79,7 +79,7 @@ All three alerts default off. The first time you turn one on, QuotaBar asks for 
 |---|---|---|
 | Hide From Screen Share | On / Off | Off (default). On replaces the menu bar strip with the QuotaBar icon and wordmark while your screen is being shared or recorded, and restores your starred metrics the moment the capture ends. See [Menu bar](menu-bar.md#hiding-usage-while-screen-sharing). |
 | Blur Account Names | On / Off | On (default). Account names on managed account cards (“Claude — Acme Corp”) render blurred in the dashboard, history, the Total Spend legend, share cards, and popover menus; tap a blurred name to reveal or re-hide it. Off always shows account names. |
-| Help make QuotaBar better by sharing anonymous usage analytics | On / Off | On (default) shares extra anonymous usage analytics — provider-refresh summaries and error categories. Off stops that extra sharing. Daily activity and crash reports are always sent. See [Privacy & Usage Data](privacy.md) for exactly what is and isn't sent. |
+| Help make QuotaBar better by sharing anonymous usage analytics | On / Off | On (default) shares extra anonymous usage analytics — provider-refresh summaries and error categories. Off stops that extra sharing. Daily activity is always sent. See [Privacy & Usage Data](privacy.md) for exactly what is and isn't sent. |
 
 ## Advanced
 
