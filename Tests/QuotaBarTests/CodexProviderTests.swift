@@ -1133,7 +1133,7 @@ final class CodexProviderTests: XCTestCase {
         XCTAssertTrue(httpClient.requests.isEmpty, "localAccounting scope must not re-read live quota APIs")
     }
 
-    func testLocalAccountingReusesPriorNativeScanWhenAvailable() async throws {
+    func testLocalAccountingPreservesUnchangedNativeUsageAndIncludesAppends() async throws {
         let now = TestLocalInstant.date(2026, 2, 20, 12)
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8)))
         let home = try CodexLogFixture.makeHome(files: [
@@ -1180,17 +1180,32 @@ final class CodexProviderTests: XCTestCase {
                        [MetricValue(number: 0.25, kind: .dollars, estimated: true),
                         MetricValue(number: 150, kind: .count, label: "tokens")])
 
-        // Remove the home directory so that any re-scanning of native sessions would find nothing.
-        try? FileManager.default.removeItem(at: home)
-
-        // Second pass in .localAccounting scope reuses cached native scan.
+        // An unchanged local-accounting wake must preserve the previous totals.
         let second = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
             await provider.refresh()
         }
-        XCTAssertEqual(values(second.lines, "Today"),
-                       [MetricValue(number: 0.25, kind: .dollars, estimated: true),
-                        MetricValue(number: 150, kind: .count, label: "tokens")],
-                       "localAccounting must reuse prior native scan without re-walking disk")
+        XCTAssertEqual(values(second.lines, "Today"), values(first.lines, "Today"))
+
+        // A native rollout can grow between wakes. The scanner may reuse unchanged
+        // per-file aggregates, but the provider must not reuse a stale entire scan.
+        let rollout = home.appendingPathComponent("sessions/rollout-1.jsonl")
+        let handle = try FileHandle(forWritingTo: rollout)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        let appended = CodexLogFixture.tokenCount(
+            timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 2),
+            last: CodexLogFixture.usage(input: 200, output: 100)
+        )
+        try handle.write(contentsOf: Data(("\n" + appended + "\n").utf8))
+        try handle.synchronize()
+
+        let third = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
+            await provider.refresh()
+        }
+        XCTAssertEqual(values(third.lines, "Today"),
+                       [MetricValue(number: 0.75, kind: .dollars, estimated: true),
+                        MetricValue(number: 450, kind: .count, label: "tokens")],
+                       "localAccounting must include newly appended native usage")
     }
 
     func testIncompletePiDiscoveryDoesNotPublishCodexOnlyHistory() async throws {

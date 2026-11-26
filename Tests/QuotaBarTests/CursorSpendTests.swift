@@ -306,7 +306,9 @@ final class CursorSpendRangeTests: XCTestCase {
         XCTAssertEqual(breakdown.totalCostUSD, 3.01, "the breakdown header keeps the known dollar subtotal")
         XCTAssertEqual(breakdown.models.map(\.model), ["gpt-5.5", "composer-1", "unpriced-cursor-model"])
         XCTAssertEqual(breakdown.models.map(\.totalTokens), [200, 100, 300])
-        XCTAssertEqual(breakdown.models[0].costUSD, 2.01, "model cost rounds once at the displayed aggregate")
+        let modelCost = try XCTUnwrap(breakdown.models[0].costUSD)
+        XCTAssertEqual(modelCost, 2.006, accuracy: 0.000001, "spend shares use the unrounded model cost")
+        XCTAssertEqual(MetricFormatter.number(modelCost, kind: .dollars, style: .row), "$2.01")
         XCTAssertNil(breakdown.models[2].costUSD, "the unpriced row claims no cost")
     }
 

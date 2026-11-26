@@ -282,16 +282,11 @@ final class SpendTileMapperTests: XCTestCase {
             ])]
         )
 
-        // The unpriced "mystery" puts the whole list on token shares (the basis the panel's percent
-        // labels use), so "alpha" — top spend but only 100 of 3,700 tokens (~3%), a sliver on both
-        // bases — is the only model small enough to fold. One model is not a group, so it keeps its
-        // name instead of becoming Other plus a second line with the same tokens and cost. "eta"
-        // clears the cap's slot count but holds 19% of measured tokens, so the token floor keeps it
-        // named anyway (the cap only ever folds slivers). The sort still ranks by cost first.
+        // Alpha leads by spend. High-token rows remain named, including unpriced usage.
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(
             breakdown.models.map(\.model),
-            ["aardvark", "beta", "delta", "epsilon", "zeta", "eta", "mystery", "alpha"]
+            ["alpha", "aardvark", "beta", "delta", "epsilon", "zeta", "eta", "mystery"]
         )
         let alpha = try XCTUnwrap(breakdown.models.first { $0.model == "alpha" })
         XCTAssertEqual(alpha.totalTokens, 100)
@@ -556,8 +551,33 @@ final class SpendTileMapperTests: XCTestCase {
         )
 
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
-        XCTAssertEqual(breakdown.models.map(\.model), ["dominant", "Other"])
-        XCTAssertEqual(breakdown.models.first?.costUSD, 1e308)
+        XCTAssertEqual(breakdown.models.map(\.model), ["Other", "dominant"])
+        XCTAssertEqual(breakdown.models.last?.costUSD, 1e308)
+    }
+
+    func testBreakdownKeepsTokensFromDaysWithoutModelDetailAndSubCentPrices() throws {
+        let lines = mappedLines(
+            [
+                DailyUsageEntry(date: "2026-06-26", totalTokens: 10, costUSD: 0.001),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 90, costUSD: nil)
+            ],
+            models: [DailyModelUsageEntry(date: "2026-06-26", models: [
+                ModelUsageEntry(model: "priced", totalTokens: 10, costUSD: 0.001)
+            ])]
+        )
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Last 30 Days"))
+        XCTAssertEqual(breakdown.models.map(\.model), ["priced", "Other"])
+        XCTAssertEqual(breakdown.models.map(\.totalTokens), [10, 90])
+        XCTAssertEqual(breakdown.models.first?.costUSD, 0.001)
+        XCTAssertNil(breakdown.models.last?.costUSD)
+    }
+
+    func testOtherExpansionKeepsUnreconciledLegacySubtotal() {
+        let other = ModelUsageEntry(model: "Other", totalTokens: 300, costUSD: 12, variants: [
+            .init(model: "priced", totalTokens: 100, costUSD: 12),
+            .init(model: "unpriced", totalTokens: 100, costUSD: nil)
+        ])
+        XCTAssertEqual(other.presentedRows(), [other])
     }
 
     // MARK: - Helpers

@@ -126,20 +126,24 @@ enum LogUsageAggregatePaths {
 /// the fold finished but produced a complete-but-empty history (not persisted, so the next call
 /// recomputes rather than serving a stale empty aggregate).
 enum AggregateComputeResult: Sendable {
-    case complete(LogUsageScan?, validUntil: Date?)
+    case complete(LogUsageScan?, validUntil: Date?, damagedLines: Int = 0)
+    case deferredByFutureTimestamp
     case incomplete
 }
 
 /// What callers should do with the fold result.
 enum AggregateCacheOutcome: Sendable {
-    case complete(LogUsageScan?)
+    case complete(LogUsageScan?, damagedLines: Int)
+    case deferredByFutureTimestamp
     case incomplete
 }
 
 actor LogUsageAggregateCache {
     static let shared = LogUsageAggregateCache(directory: LogUsageAggregatePaths.defaultDirectory)
 
-    private static let schemaVersion = 2
+    /// v3: the Codex router/proxy folds moved to the shared `sinceDate` window convention — entries
+    /// folded under the old `startOfDay - (days-1)` convention are one day short and must recompute.
+    private static let schemaVersion = 3
     /// Reuse bound. Retention windows are ≥ 35 days while request windows are ≤ ~33, so anything
     /// reused within this horizon still covers the full requested window. Beyond it, recompute.
     static let maxReuseAge: TimeInterval = 36 * 3600
@@ -156,6 +160,7 @@ actor LogUsageAggregateCache {
         /// Once `now` reaches it, the aggregate is stale by time alone: an event that was "not yet
         /// eligible" then has become eligible now.
         var validUntil: Date?
+        var damagedLines: Int?
     }
 
     private let directory: URL
@@ -187,18 +192,24 @@ actor LogUsageAggregateCache {
            entry.daysBack == days,
            entry.fingerprints == fingerprints,
            entry.validUntil.map({ now < $0 }) ?? true,
+           // A clock moved backward past the compute instant makes the entry untrustworthy in
+           // the same way the inner index's latestIncludedEventAt check does — rebuild.
+           now >= entry.computedAt,
            now.timeIntervalSince(entry.computedAt) <= Self.maxReuseAge
         {
-            return .complete(Self.windowFiltered(entry.scan, daysBack: days, now: now))
+            return .complete(Self.windowFiltered(entry.scan, daysBack: days, now: now),
+                             damagedLines: entry.damagedLines ?? 0)
         }
         switch await compute() {
+        case .deferredByFutureTimestamp:
+            return .deferredByFutureTimestamp
         case .incomplete:
             return .incomplete
-        case .complete(let fresh, let validUntil):
+        case .complete(let fresh, let validUntil, let damagedLines):
             guard let fresh else {
                 // A complete fold with no rows persists nothing useful; the empty result is not a
                 // failure, it is just not cacheable.
-                return .complete(nil)
+                return .complete(nil, damagedLines: damagedLines)
             }
             let entry = Entry(
                 schemaVersion: Self.schemaVersion,
@@ -208,11 +219,12 @@ actor LogUsageAggregateCache {
                 fingerprints: fingerprints,
                 computedAt: now,
                 scan: fresh,
-                validUntil: validUntil
+                validUntil: validUntil,
+                damagedLines: damagedLines
             )
             entries[key] = entry
             persist(entry)
-            return .complete(fresh)
+            return .complete(fresh, damagedLines: damagedLines)
         }
     }
 
@@ -255,8 +267,25 @@ actor LogUsageAggregateCache {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let data = try PropertyListEncoder().encode(entry)
             try data.write(to: fileURL(for: entry.key), options: .atomic)
+            pruneStaleFiles()
         } catch {
             AppLog.warn(.cache, "could not persist usage aggregate: \(error.localizedDescription)")
+        }
+    }
+
+    /// Drops aggregate files older than the reuse horizon — schema bumps and scope-key changes
+    /// orphan entries that no key will ever match again, so they must not accumulate forever.
+    private func pruneStaleFiles() {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        let cutoff = Date().addingTimeInterval(-Self.maxReuseAge)
+        for url in files where url.lastPathComponent.hasPrefix("aggregate-") {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            if let modified, modified < cutoff {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
     }
 
