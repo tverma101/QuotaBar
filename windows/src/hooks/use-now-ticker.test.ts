@@ -1,6 +1,16 @@
 import { renderHook, act } from "@testing-library/react"
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest"
-import { useNowTicker } from "./use-now-ticker"
+import { countdownTickerIntervalMs, useNowTicker } from "./use-now-ticker"
+
+describe("countdownTickerIntervalMs", () => {
+  it("uses minute-granularity ticks until the final minute", () => {
+    const now = 1_000_000
+    expect(countdownTickerIntervalMs(null, now)).toBe(30_000)
+    expect(countdownTickerIntervalMs(now + 61_000, now)).toBe(30_000)
+    expect(countdownTickerIntervalMs(now + 60_000, now)).toBe(1_000)
+    expect(countdownTickerIntervalMs(now - 1_000, now)).toBe(30_000)
+  })
+})
 
 describe("useNowTicker", () => {
   let originalDocumentHiddenDescriptor: PropertyDescriptor | undefined

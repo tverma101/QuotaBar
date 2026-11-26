@@ -3,7 +3,7 @@ import { ChevronDown, History, Info, Loader2, Power, Settings, SlidersHorizontal
 import { AboutDialog } from "@/components/about-dialog"
 import { UpdateStatusLabel } from "@/components/update-status-label"
 import type { UpdateStatus } from "@/hooks/use-app-update"
-import { useNowTicker } from "@/hooks/use-now-ticker"
+import { countdownTickerIntervalMs, useNowTicker } from "@/hooks/use-now-ticker"
 import { cn } from "@/lib/utils"
 
 type ModernFooterProps = {
@@ -49,7 +49,8 @@ export function ModernFooter({
   onOpenSettings,
   onQuit,
 }: ModernFooterProps) {
-  const now = useNowTicker({ enabled: Boolean(autoUpdateNextAt), resetKey: autoUpdateNextAt })
+  const tickerIntervalMs = countdownTickerIntervalMs(autoUpdateNextAt)
+  const now = useNowTicker({ enabled: Boolean(autoUpdateNextAt), intervalMs: tickerIntervalMs, resetKey: autoUpdateNextAt })
   const countdown = useMemo(() => nextUpdateLabel(autoUpdateNextAt, now), [autoUpdateNextAt, now])
 
   return (

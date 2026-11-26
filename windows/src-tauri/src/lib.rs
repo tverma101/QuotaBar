@@ -930,6 +930,7 @@ fn run_and_emit_probe(
         let persist = !has_error && persist_usage_history_enabled(handle);
         if has_error {
             log::warn!("probe {} completed with error", plugin_id);
+            local_http_api::record_probe_failure(&plugin_id);
         } else {
             log::info!(
                 "probe {} completed ok ({} lines)",

@@ -1,9 +1,14 @@
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(any(target_os = "linux", test))]
 const FREEDESKTOP_STEREO: &str = "/usr/share/sounds/freedesktop/stereo";
 
 /// Maps macOS alert names (shared with settings UI) to freedesktop sound files on Linux.
+#[cfg(any(target_os = "linux", test))]
 fn linux_sound_candidates(sound: &str) -> &'static [&'static str] {
     match sound {
         "Basso" => &["dialog-warning.oga", "complete.oga"],
@@ -24,6 +29,7 @@ fn linux_sound_candidates(sound: &str) -> &'static [&'static str] {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn first_existing_sound(candidates: &[&str]) -> Option<PathBuf> {
     let dirs = [
         FREEDESKTOP_STEREO,

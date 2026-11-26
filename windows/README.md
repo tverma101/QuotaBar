@@ -46,4 +46,4 @@ bun run tauri:build --bundles nsis -- --locked
 
 The `-setup.exe` is under `target/release/bundle/nsis/`. For local development, use `bun run tauri:dev:win` after installing dependencies. For a public build, use [the tagged release workflow](../docs/releasing.md#windows).
 
-The desktop port uses Tauri, a React interface, a Rust backend/core, and a local QuickJS provider runtime. See [provenance](PROVENANCE.md) for attribution and upstream synchronization details.
+The desktop port uses Tauri, a React interface, a Rust backend/core, and a local QuickJS provider runtime. Development builds load `plugins/` beside the working directory; release builds only use bundled/installed plugins unless `QUOTABAR_PLUGINS_DIR` explicitly points at an override directory. Native Claude, Codex, Grok, and pi history scans reuse parsed JSONL files while their path, size, and modification time are unchanged. See [provenance](PROVENANCE.md) for attribution and upstream synchronization details.
