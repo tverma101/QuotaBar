@@ -119,6 +119,14 @@ describe("modern-layout-store descriptor sync", () => {
     expect(useModernLayoutStore.getState().metricOrderByProvider).toBe(after.metricOrderByProvider)
   })
 
+  it("does not rewrite the layout when the focused provider is focused again", () => {
+    useModernLayoutStore.getState().setTrayFocusProvider("claude")
+    expect(saveModernLayout).not.toHaveBeenCalled()
+    useModernLayoutStore.getState().setTrayFocusProvider("cursor")
+    expect(saveModernLayout).toHaveBeenCalledTimes(1)
+    expect(useModernLayoutStore.getState().trayFocusProviderId).toBe("cursor")
+  })
+
   it("still writes when a pinned metric disappears", () => {
     useModernLayoutStore.getState().syncDescriptors(descriptors)
     vi.mocked(saveModernLayout).mockClear()

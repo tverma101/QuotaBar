@@ -133,6 +133,8 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
   },
 
   setTrayFocusProvider: (pluginId) => {
+    // Clicking the card that already drives the tray changes nothing; skip the write.
+    if (get().trayFocusProviderId === pluginId) return
     set({ trayFocusProviderId: pluginId })
     void get().persist()
   },
