@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react"
 
+
+export function countdownTickerIntervalMs(targetAt: number | null, now = Date.now()): number {
+  if (targetAt == null) return 30_000
+  const remainingMs = targetAt - now
+  return remainingMs >= 0 && remainingMs <= 60_000 ? 1_000 : 30_000
+}
+
 type UseNowTickerOptions = {
   enabled?: boolean
   intervalMs?: number

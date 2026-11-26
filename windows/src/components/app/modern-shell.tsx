@@ -17,7 +17,7 @@ import { useTrayRestartBridge } from "@/hooks/app/use-tray-restart-bridge"
 import type { UpdateStatus } from "@/hooks/use-app-update"
 import { useModernDashboard } from "@/hooks/app/use-modern-dashboard"
 import { useModernPanel } from "@/hooks/app/use-modern-panel"
-import { useNowTicker } from "@/hooks/use-now-ticker"
+import { countdownTickerIntervalMs, useNowTicker } from "@/hooks/use-now-ticker"
 import { metricId } from "@/lib/metric-id"
 import { isMetricOnDemand } from "@/lib/metric-display"
 import { getProviderInstanceMeta, type UILayout } from "@/lib/settings"
@@ -90,7 +90,20 @@ export function ModernShell({
   )
 
   const compact = modernDensity === "compact"
-  const nowMs = useNowTicker()
+  const nearestResetAtMs = useMemo(() => {
+    const startedAt = Date.now()
+    let nearest: number | null = null
+    for (const state of displayPlugins) {
+      for (const line of state.data?.lines ?? []) {
+        if (line.type !== "progress" || !line.resetsAt) continue
+        const resetsAtMs = Date.parse(line.resetsAt)
+        if (!Number.isFinite(resetsAtMs) || resetsAtMs < startedAt) continue
+        if (nearest == null || resetsAtMs < nearest) nearest = resetsAtMs
+      }
+    }
+    return nearest
+  }, [displayPlugins])
+  const nowMs = useNowTicker({ intervalMs: countdownTickerIntervalMs(nearestResetAtMs) })
   const dashboard = useModernDashboard(displayPlugins, nowMs)
   const { pluginSettings, pluginsMeta, descriptors, placedMetricIds } = dashboard
 

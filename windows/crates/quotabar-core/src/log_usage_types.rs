@@ -1,15 +1,16 @@
 //! Shared types for native Claude/Codex log scanners (ccusage-compatible daily output).
 
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// Newest-N file cap per scan pass (upstream #888 bound for large log trees).
 pub const LOG_SCAN_MAX_FILES: usize = 500;
 /// Soft byte budget for files considered in one pass (always keeps ≥1 file if any).
 pub const LOG_SCAN_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const USAGE_FILE_CACHE_MAX_FILES: usize = 2 * LOG_SCAN_MAX_FILES;
 
 /// Cap JSON token counts so malformed values cannot wrap `i32` (#1172).
 pub fn bounded_token_count(n: i64) -> i32 {
@@ -73,10 +74,122 @@ pub fn warn_unreadable_usage_file(path: &Path) {
     }
 }
 
+pub struct UsageFileCache<T> {
+    files: HashMap<String, CachedUsageFile<T>>,
+}
+
+struct CachedUsageFile<T> {
+    size: u64,
+    mtime: SystemTime,
+    entries: Arc<Vec<T>>,
+}
+
+impl<T> Default for UsageFileCache<T> {
+    fn default() -> Self {
+        Self { files: HashMap::new() }
+    }
+}
+
+impl<T> UsageFileCache<T> {
+    pub fn get_or_parse(
+        &mut self,
+        path: &Path,
+        size: u64,
+        mtime: SystemTime,
+        parse: impl FnOnce() -> Vec<T>,
+    ) -> Arc<Vec<T>> {
+        let key = path.to_string_lossy().to_string();
+        if let Some(cached) = self.files.get(&key) {
+            if cached.size == size && cached.mtime == mtime {
+                return cached.entries.clone();
+            }
+        }
+        let entries = Arc::new(parse());
+        self.files.insert(
+            key,
+            CachedUsageFile {
+                size,
+                mtime,
+                entries: entries.clone(),
+            },
+        );
+        entries
+    }
+
+    pub fn finish_scan(
+        &mut self,
+        scanned_paths: &HashSet<String>,
+        reusable_mtime: impl Fn(&SystemTime) -> bool,
+        max_files: usize,
+    ) {
+        self.files.retain(|path, cached| {
+            scanned_paths.contains(path) || reusable_mtime(&cached.mtime)
+        });
+        if self.files.len() <= max_files {
+            return;
+        }
+        let mut newest: Vec<(String, SystemTime)> = self
+            .files
+            .iter()
+            .map(|(path, cached)| (path.clone(), cached.mtime))
+            .collect();
+        newest.sort_by(|a, b| b.1.cmp(&a.1));
+        let keep: HashSet<String> = newest
+            .into_iter()
+            .take(max_files)
+            .map(|(path, _)| path)
+            .collect();
+        self.files.retain(|path, _| keep.contains(path));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn usage_file_cache_reuses_unchanged_parse_and_reparses_changed_files() {
+        let mut cache = UsageFileCache::default();
+        let path = Path::new("usage.jsonl");
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let parses = std::cell::Cell::new(0);
+
+        let first = cache.get_or_parse(path, 10, mtime, || {
+            parses.set(parses.get() + 1);
+            vec![1u8]
+        });
+        let second = cache.get_or_parse(path, 10, mtime, || {
+            parses.set(parses.get() + 1);
+            vec![2u8]
+        });
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(parses.get(), 1);
+
+        let changed = cache.get_or_parse(path, 11, mtime, || {
+            parses.set(parses.get() + 1);
+            vec![3u8]
+        });
+        assert_eq!(changed.as_slice(), &[3]);
+        assert_eq!(parses.get(), 2);
+    }
+
+    #[test]
+    fn usage_file_cache_retains_reusable_entries_and_evicts_expired_or_overflow() {
+        let mut cache = UsageFileCache::default();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let new = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        for index in 0..4 {
+            let path = PathBuf::from(format!("usage-{index}.jsonl"));
+            cache.get_or_parse(&path, 1, if index == 0 { old } else { new }, || vec![index]);
+        }
+
+        cache.finish_scan(&HashSet::new(), |mtime| *mtime == new, 3);
+        assert!(!cache.files.contains_key("usage-0.jsonl"));
+        assert!(cache.files.contains_key("usage-1.jsonl"));
+        assert_eq!(cache.files.len(), 3);
+    }
 
     #[test]
     fn caps_newest_files_and_byte_budget() {

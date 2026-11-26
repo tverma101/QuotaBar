@@ -4,7 +4,8 @@
 use crate::claude_usage_scanner::parse_iso_timestamp;
 use crate::log_usage_types::{
     DailyUsageRow, ModelDayUsage, TokenBreakdown, cap_log_files_by_mtime, expand_tilde,
-    local_day_key_from_offset, since_local_midnight, warn_unreadable_usage_file,
+    local_day_key_from_offset, since_local_midnight, warn_unreadable_usage_file, UsageFileCache,
+    USAGE_FILE_CACHE_MAX_FILES,
 };
 use crate::model_pricing::{ModelPricing, default_pricing};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -13,7 +14,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
+
+
+static FILE_CACHE: Mutex<Option<UsageFileCache<Entry>>> = Mutex::new(None);
 
 #[derive(Clone)]
 struct Entry {
@@ -97,11 +102,29 @@ fn scan(card_id: &str, days_back: i32, pricing: &ModelPricing) -> Option<Vec<Dai
     }
     let since = since_local_midnight(days_back);
     let mut entries = Vec::new();
-    for file in &files {
-        if file_mtime_before(&file.mtime, since) {
-            continue;
+    if let Ok(mut guard) = FILE_CACHE.lock() {
+        let cache = guard.get_or_insert_with(UsageFileCache::default);
+        let mut scanned_paths = HashSet::new();
+        for file in &files {
+            if file_mtime_before(&file.mtime, since) {
+                continue;
+            }
+            scanned_paths.insert(file.path.to_string_lossy().to_string());
+            let file_entries = cache.get_or_parse(&file.path, file.size, file.mtime, || {
+                parse_file(&file.path)
+            });
+            entries.extend(
+                file_entries
+                    .iter()
+                    .filter(|entry| entry.timestamp >= since && entry.card_id == card_id)
+                    .cloned(),
+            );
         }
-        entries.extend(parse_file(&file.path));
+        cache.finish_scan(
+            &scanned_paths,
+            |mtime| !file_mtime_before(mtime, since),
+            USAGE_FILE_CACHE_MAX_FILES,
+        );
     }
     Some(aggregate(&dedup(entries), card_id, since, pricing))
 }

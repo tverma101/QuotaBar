@@ -3,7 +3,7 @@ import { AboutDialog } from "@/components/about-dialog";
 import { fireMotionShock } from "@/components/motion-field";
 import { UpdateStatusLabel } from "@/components/update-status-label";
 import type { UpdateStatus } from "@/hooks/use-app-update";
-import { useNowTicker } from "@/hooks/use-now-ticker";
+import { countdownTickerIntervalMs, useNowTicker } from "@/hooks/use-now-ticker";
 
 interface PanelFooterProps {
   version: string;
@@ -31,8 +31,10 @@ export function PanelFooter({
   onCloseAbout,
   trailing,
 }: PanelFooterProps) {
+  const tickerIntervalMs = countdownTickerIntervalMs(autoUpdateNextAt);
   const now = useNowTicker({
     enabled: Boolean(autoUpdateNextAt),
+    intervalMs: tickerIntervalMs,
     resetKey: autoUpdateNextAt,
   });
 

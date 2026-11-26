@@ -5,7 +5,7 @@ use crate::claude_usage_scanner::parse_iso_timestamp;
 use crate::log_usage_types::{
     DailyUsageRow, LogScanStatus, ModelDayUsage, TokenBreakdown, cap_log_files_by_mtime,
     expand_tilde, host_query_response, local_day_key_from_offset, since_local_midnight,
-    warn_unreadable_usage_file,
+    warn_unreadable_usage_file, UsageFileCache, USAGE_FILE_CACHE_MAX_FILES,
 };
 use crate::model_pricing::{ModelPricing, default_pricing};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -14,11 +14,15 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 /// Cap before i32 conversion. Swift uses 1e12; DailyUsageRow tokens are i32.
 const MAXIMUM_PLAUSIBLE_TOKENS: i32 = 1_000_000_000;
 const COST_TICKS_PER_USD: f64 = 10_000_000_000.0;
+
+
+static FILE_CACHE: Mutex<Option<UsageFileCache<Entry>>> = Mutex::new(None);
 
 #[derive(Clone)]
 struct Entry {
@@ -87,9 +91,30 @@ fn scan(
     if files.is_empty() {
         return None;
     }
-    let entries = files
-        .iter()
-        .flat_map(|file| parse_file(&file.path))
+    let mut parsed_entries = Vec::new();
+    if let Ok(mut guard) = FILE_CACHE.lock() {
+        let cache = guard.get_or_insert_with(UsageFileCache::default);
+        let mut scanned_paths = HashSet::new();
+        for file in &files {
+            scanned_paths.insert(file.path.to_string_lossy().to_string());
+            let file_entries = cache.get_or_parse(&file.path, file.size, file.mtime, || {
+                parse_file(&file.path)
+            });
+            parsed_entries.extend(
+                file_entries
+                    .iter()
+                    .filter(|entry| entry.timestamp >= since)
+                    .cloned(),
+            );
+        }
+        cache.finish_scan(
+            &scanned_paths,
+            |mtime| !file_mtime_before(mtime, since),
+            USAGE_FILE_CACHE_MAX_FILES,
+        );
+    }
+    let entries = parsed_entries
+        .into_iter()
         .filter(|entry| entry.timestamp >= since);
     Some(aggregate(dedup(entries), pricing))
 }
@@ -167,7 +192,7 @@ fn file_mtime_before(mtime: &SystemTime, since: DateTime<Utc>) -> bool {
     file_dt < since
 }
 
-fn parse_file(path: &Path) -> impl Iterator<Item = Entry> {
+fn parse_file(path: &Path) -> Vec<Entry> {
     let reader = match fs::File::open(path) {
         Ok(file) => Some(BufReader::new(file)),
         Err(_) => {
@@ -186,6 +211,7 @@ fn parse_file(path: &Path) -> impl Iterator<Item = Entry> {
             serde_json::from_str::<Value>(text).ok()
         })
         .flat_map(|value| parse_completed_turn(&value))
+        .collect()
 }
 
 fn parse_completed_turn(object: &Value) -> Vec<Entry> {

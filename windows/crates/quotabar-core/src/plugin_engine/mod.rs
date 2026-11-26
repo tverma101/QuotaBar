@@ -93,6 +93,17 @@ fn is_retired_bundled_plugin_id(id: &str) -> bool {
 }
 
 fn find_dev_plugins_dir() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("QUOTABAR_PLUGINS_DIR") {
+        let dir = PathBuf::from(explicit);
+        if dir.is_dir() {
+            return Some(dir);
+        }
+        log::warn!("QUOTABAR_PLUGINS_DIR is not a directory: {}", dir.display());
+        return None;
+    }
+    if !cfg!(debug_assertions) {
+        return None;
+    }
     let cwd = std::env::current_dir().ok()?;
     let direct = cwd.join("plugins");
     if direct.exists() {
@@ -182,15 +193,16 @@ fn list_missing_plugin_dirs(bundled_dir: &Path, install_dir: &Path) -> Vec<Strin
     missing
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
+fn copy_dir_recursive(src: &Path, dst: &Path) -> usize {
     let entries = match std::fs::read_dir(src) {
         Ok(entries) => entries,
         Err(err) => {
             log::warn!("failed to read dir {}: {}", src.display(), err);
-            return;
+            return 0;
         }
     };
 
+    let mut copied = 0usize;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -220,18 +232,40 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
                 log::warn!("failed to create dir {}: {}", dst_path.display(), err);
                 continue;
             }
-            copy_dir_recursive(&src_path, &dst_path);
+            copied += copy_dir_recursive(&src_path, &dst_path);
         } else if file_type.is_file() {
-            if let Err(err) = std::fs::copy(&src_path, &dst_path) {
-                log::warn!(
-                    "failed to copy {} to {}: {}",
-                    src_path.display(),
-                    dst_path.display(),
-                    err
-                );
+            if copy_file_if_changed(&src_path, &dst_path) {
+                copied += 1;
             }
         }
     }
+    copied
+}
+
+fn copy_file_if_changed(src_path: &Path, dst_path: &Path) -> bool {
+    let needs_copy = match (std::fs::metadata(src_path), std::fs::metadata(dst_path)) {
+        (Ok(src_meta), Ok(dst_meta)) if src_meta.len() == dst_meta.len() => {
+            match (std::fs::read(src_path), std::fs::read(dst_path)) {
+                (Ok(src_bytes), Ok(dst_bytes)) => src_bytes != dst_bytes,
+                _ => true,
+            }
+        }
+        (Ok(_), _) => true,
+        _ => false,
+    };
+    if !needs_copy {
+        return false;
+    }
+    if let Err(err) = std::fs::copy(src_path, dst_path) {
+        log::warn!(
+            "failed to copy {} to {}: {}",
+            src_path.display(),
+            dst_path.display(),
+            err
+        );
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -374,4 +408,25 @@ mod tests {
         assert!(mismatched_dir.exists());
         assert!(plugins.is_empty());
     }
+
+    #[test]
+    fn copy_dir_recursive_skips_unchanged_files_and_updates_changed_files() {
+        let root = TempDir::new("incremental-copy");
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+        write_plugin(&src, "devin", "Devin");
+
+        let first = copy_dir_recursive(&src, &dst);
+        assert!(first >= 3);
+        assert_eq!(copy_dir_recursive(&src, &dst), 0);
+
+        fs::write(
+            src.join("devin").join("plugin.js"),
+            r#"globalThis.__openusage_plugin = { id: "devin", probe: () => ({ lines: [1] }) }"#,
+        )
+        .expect("change plugin");
+        assert_eq!(copy_dir_recursive(&src, &dst), 1);
+        assert_eq!(copy_dir_recursive(&src, &dst), 0);
+    }
+
 }

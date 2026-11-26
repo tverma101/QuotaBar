@@ -5,24 +5,19 @@ use crate::codex_pricing::{self, CodexCostInput};
 use crate::log_usage_types::{
     DailyUsageRow, LogScanStatus, ModelDayUsage, cap_log_files_by_mtime,
     expand_tilde, host_query_response, local_day_key_from_offset, merge_daily_rows,
-    since_local_midnight, warn_unreadable_usage_file,
+    since_local_midnight, warn_unreadable_usage_file, UsageFileCache, USAGE_FILE_CACHE_MAX_FILES,
 };
 use crate::model_pricing::{ModelPricing, default_pricing};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-static FILE_CACHE: Mutex<Option<HashMap<String, CachedFile>>> = Mutex::new(None);
+static FILE_CACHE: Mutex<Option<UsageFileCache<CodexEvent>>> = Mutex::new(None);
 
-struct CachedFile {
-    size: u64,
-    mtime: SystemTime,
-    events: Vec<CodexEvent>,
-}
 
 #[derive(Clone)]
 struct CodexEvent {
@@ -106,36 +101,32 @@ fn scan_homes(homes: &[PathBuf], days_back: i32, pricing: &ModelPricing) -> Opti
     let since = since_local_midnight(days_back);
     let mut events = Vec::new();
     if let Ok(mut guard) = FILE_CACHE.lock() {
-        let cache = guard.get_or_insert_with(HashMap::new);
-        let mut next_cache = HashMap::new();
+        let cache = guard.get_or_insert_with(UsageFileCache::default);
+        let mut scanned_paths = HashSet::new();
         for file in &files {
             if file_mtime_before(&file.mtime, since) {
                 continue;
             }
-            let key = file.path.to_string_lossy().to_string();
-            let file_events = if let Some(cached) = cache.get(&key) {
-                if cached.size == file.size && cached.mtime == file.mtime {
-                    cached.events.clone()
-                } else {
-                    parse_file(&file.path)
-                }
-            } else {
+            scanned_paths.insert(file.path.to_string_lossy().to_string());
+            let file_events = cache.get_or_parse(&file.path, file.size, file.mtime, || {
                 parse_file(&file.path)
-            };
-            next_cache.insert(
-                key,
-                CachedFile {
-                    size: file.size,
-                    mtime: file.mtime,
-                    events: file_events.clone(),
-                },
+            });
+            events.extend(
+                file_events
+                    .iter()
+                    .filter(|event| event.timestamp >= since)
+                    .cloned(),
             );
-            events.extend(file_events);
         }
-        *cache = next_cache;
+        cache.finish_scan(
+            &scanned_paths,
+            |mtime| !file_mtime_before(mtime, since),
+            USAGE_FILE_CACHE_MAX_FILES,
+        );
     }
     Some(aggregate(&dedup_events(events), since, pricing))
 }
+
 
 fn codex_homes(home_path: Option<&str>) -> Vec<PathBuf> {
     let raw = home_path

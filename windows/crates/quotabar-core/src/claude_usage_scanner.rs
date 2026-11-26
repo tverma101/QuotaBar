@@ -3,7 +3,7 @@
 use crate::log_usage_types::{
     DailyUsageRow, LogScanStatus, ModelDayUsage, TokenBreakdown, cap_log_files_by_mtime,
     expand_tilde, host_query_response, local_day_key_from_offset, merge_daily_rows,
-    since_local_midnight, warn_unreadable_usage_file,
+    since_local_midnight, warn_unreadable_usage_file, UsageFileCache, USAGE_FILE_CACHE_MAX_FILES,
 };
 use crate::model_pricing::{ModelPricing, default_pricing};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -15,13 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-static FILE_CACHE: Mutex<Option<HashMap<String, CachedFile>>> = Mutex::new(None);
+static FILE_CACHE: Mutex<Option<UsageFileCache<ClaudeEntry>>> = Mutex::new(None);
 
-struct CachedFile {
-    size: u64,
-    mtime: SystemTime,
-    entries: Vec<ClaudeEntry>,
-}
 
 #[derive(Clone)]
 struct ClaudeEntry {
@@ -94,36 +89,32 @@ fn scan_roots(roots: &[PathBuf], since: DateTime<Utc>, pricing: &ModelPricing) -
     }
     let mut entries = Vec::new();
     if let Ok(mut guard) = FILE_CACHE.lock() {
-        let cache = guard.get_or_insert_with(HashMap::new);
-        let mut next_cache = HashMap::new();
+        let cache = guard.get_or_insert_with(UsageFileCache::default);
+        let mut scanned_paths = HashSet::new();
         for file in &files {
             if file_mtime_before(&file.mtime, since) {
                 continue;
             }
-            let key = file.path.to_string_lossy().to_string();
-            let file_entries = if let Some(cached) = cache.get(&key) {
-                if cached.size == file.size && cached.mtime == file.mtime {
-                    cached.entries.clone()
-                } else {
-                    parse_file(&file.path)
-                }
-            } else {
+            scanned_paths.insert(file.path.to_string_lossy().to_string());
+            let file_entries = cache.get_or_parse(&file.path, file.size, file.mtime, || {
                 parse_file(&file.path)
-            };
-            next_cache.insert(
-                key,
-                CachedFile {
-                    size: file.size,
-                    mtime: file.mtime,
-                    entries: file_entries.clone(),
-                },
+            });
+            entries.extend(
+                file_entries
+                    .iter()
+                    .filter(|entry| entry.timestamp >= since)
+                    .cloned(),
             );
-            entries.extend(file_entries);
         }
-        *cache = next_cache;
+        cache.finish_scan(
+            &scanned_paths,
+            |mtime| !file_mtime_before(mtime, since),
+            USAGE_FILE_CACHE_MAX_FILES,
+        );
     }
     Some(aggregate(&dedup(entries), since, pricing))
 }
+
 
 fn claude_roots(home_path: Option<&str>) -> Vec<PathBuf> {
     let configured = std::env::var("CLAUDE_CONFIG_DIR").ok();
