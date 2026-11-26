@@ -28,7 +28,7 @@ Both platforms track the same core usage concepts, but provider support and plat
 
 Claude, Codex, Cursor, and Freebuff are enabled on a fresh install. Sign in through the corresponding provider tool, then refresh QuotaBar. Open **Options → Customize** to manage additional providers in the macOS or Windows Modern dashboard. Provider and metric availability varies by platform.
 
-Updates are manual. On Windows, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account. On macOS, check out the newer tag and rebuild. [All releases](https://github.com/tverma101/QuotaBar/releases)
+On Windows, updater-enabled installs check QuotaBar's signed release feed, download newer installers in the background, and show **Ready to update** when one is ready. Versions before the first updater release need one manual update: open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account. On macOS, check out the newer tag and rebuild. [All releases](https://github.com/tverma101/QuotaBar/releases)
 
 ## Build From Source
 

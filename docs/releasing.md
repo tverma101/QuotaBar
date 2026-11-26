@@ -37,7 +37,7 @@ Before publishing, install from that image on a clean Mac user profile with Gate
 
 ## Windows
 
-Create the owner-approved version tag from the tested commit on `main`. Run **Windows CI** on that tag. The workflow uses the tag as the installer version and tests the per-user install, bundled CLI, cached limits, and uninstall before uploading `quotabar-windows-x64-qa`. Tagged builds also sign the installer for the in-app updater with the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets, and fail if those secrets are missing.
+Create the owner-approved version tag from the tested commit on `main`. Pushing the tag runs **Windows CI** automatically; it can also be run manually on the tag. The workflow uses the tag as the installer version and tests the per-user install, bundled CLI, cached limits, and uninstall before uploading `quotabar-windows-x64-qa`. Tagged builds also sign the installer for the in-app updater with the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets, and fail if those secrets are missing.
 
 Download the artifact from that run and verify its archive SHA-256 against the digest reported by GitHub Actions. Extract the matching `QuotaBar_<version>_x64-setup.exe` and its `QuotaBar_<version>_x64-setup.exe.sig`. The build uses MSVC for the public installer.
 

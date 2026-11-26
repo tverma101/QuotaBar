@@ -437,7 +437,10 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                 }
                 "restart" => {
                     log::info!("restart requested via tray");
-                    app_handle.request_restart();
+                    if let Err(error) = app_handle.emit("tray:restart-or-update", ()) {
+                        log::error!("failed to forward tray restart to the webview: {}", error);
+                        app_handle.request_restart();
+                    }
                 }
                 "quit" => {
                     log::info!("quit requested via tray");
