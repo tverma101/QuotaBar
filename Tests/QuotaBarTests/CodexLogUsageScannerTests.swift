@@ -1013,11 +1013,15 @@ final class CodexLogUsageScannerTests: XCTestCase {
         )
         // Cut mid-JSON just past the token_count marker so the parser classifies the line as
         // damaged. Cut relative to the marker itself: fixture JSON key order is not guaranteed.
+        // When the marker is the line's last field there are fewer than 10 characters after it, so
+        // always drop at least the closing brace — otherwise the "torn" line is a complete copy.
         let markerEnd = valid.range(of: "token_count")!.upperBound
-        let tornEnd = valid.index(markerEnd, offsetBy: 10, limitedBy: valid.endIndex) ?? valid.endIndex
+        let lastIndex = valid.index(before: valid.endIndex)
+        let tornEnd = valid.index(markerEnd, offsetBy: 10, limitedBy: lastIndex) ?? lastIndex
         let torn = String(valid[..<tornEnd])
         XCTAssertTrue(torn.contains("token_count"),
                       "the torn line must reach the marker to count as damaged usage data")
+        XCTAssertNotEqual(torn, valid, "the torn line must not be a complete record")
         let home = try CodexLogFixture.makeHome(files: [
             "sessions/rollout-a.jsonl": torn + "\n" + valid
         ])
