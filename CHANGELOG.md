@@ -62,6 +62,7 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 
 ## Unreleased
 
+- Windows: redraw the tray icon and rewrite the saved Modern layout only when their content changes, instead of after every provider result.
 - Resume deferred provider refreshes in narrow per-provider batches instead of re-running the full accounting pass — a single skipped provider no longer re-folds every provider's history.
 - Open the spend model breakdown directly on hover or tap for every period — the Last 30 Days tile no longer hides its list behind a Show Model Breakdown button.
 - Keep the breakdown to the period's top three models with the rest folded under an expandable Other row, and keep the popover open through taps inside the panel until the pointer leaves it.

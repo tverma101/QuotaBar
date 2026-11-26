@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import type { ReactNode } from "react"
 import userEvent from "@testing-library/user-event"
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest"
@@ -535,6 +535,66 @@ describe("App", () => {
 
     await waitFor(() => expect(state.renderTrayBarsIconMock).toHaveBeenCalled())
     await waitFor(() => expect(state.traySetIconMock).toHaveBeenCalled())
+  })
+
+  it("skips re-applying an unchanged tray icon and redraws when the value changes", async () => {
+    vi.useFakeTimers()
+    try {
+      state.invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "get_platform") return "macos"
+        if (cmd === "list_plugins") {
+          return [
+            {
+              id: "a",
+              name: "Alpha",
+              iconUrl: "icon-a",
+              primaryCandidates: ["Session"],
+              lines: [{ type: "progress", label: "Session", scope: "overview" }],
+            },
+          ]
+        }
+        return null
+      })
+      state.loadPluginSettingsMock.mockResolvedValueOnce({ order: ["a"], disabled: [] })
+
+      render(<App />)
+      await vi.waitFor(() => expect(state.startBatchMock).toHaveBeenCalled())
+      await vi.waitFor(() => expect(state.trayGetByIdMock).toHaveBeenCalled())
+
+      const sendResult = async (used: number) => {
+        state.probeHandlers?.onResult({
+          providerId: "a",
+          displayName: "Alpha",
+          iconUrl: "icon-a",
+          lines: [{ type: "progress", label: "Session", used, limit: 100, format: { kind: "percent" } }],
+        })
+        await act(async () => {})
+        await vi.advanceTimersByTimeAsync(600)
+      }
+
+      await sendResult(40)
+      await vi.waitFor(() =>
+        expect(state.renderTrayBarsIconMock).toHaveBeenLastCalledWith(
+          expect.objectContaining({ percentText: "60%" }), // display mode "left": 40 used shows 60
+        )
+      )
+      state.renderTrayBarsIconMock.mockClear()
+      state.traySetIconMock.mockClear()
+
+      await sendResult(40)
+      expect(state.renderTrayBarsIconMock).not.toHaveBeenCalled()
+      expect(state.traySetIconMock).not.toHaveBeenCalled()
+
+      await sendResult(55)
+      await vi.waitFor(() =>
+        expect(state.renderTrayBarsIconMock).toHaveBeenLastCalledWith(
+          expect.objectContaining({ percentText: "45%" }),
+        )
+      )
+      await vi.waitFor(() => expect(state.traySetIconMock).toHaveBeenCalledTimes(1))
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("renders first provider tray icon on launch before probe data", async () => {
@@ -1839,7 +1899,7 @@ describe("App", () => {
         resolveFirstRender = resolve
       })
 
-      state.invokeMock.mockImplementationOnce(async (cmd: string) => {
+      state.invokeMock.mockImplementation(async (cmd: string) => {
         if (cmd === "get_platform") return "macos"
         if (cmd === "list_plugins") {
           return [
@@ -1955,7 +2015,7 @@ describe("App", () => {
       const rafSpy = vi.fn()
       window.requestAnimationFrame = rafSpy
 
-      state.invokeMock.mockImplementationOnce(async (cmd: string) => {
+      state.invokeMock.mockImplementation(async (cmd: string) => {
         if (cmd === "get_platform") return "macos"
         if (cmd === "list_plugins") {
           return [
@@ -1963,7 +2023,7 @@ describe("App", () => {
               id: "a",
               name: "Alpha",
               iconUrl: "icon-a",
-              primaryProgressLabel: "Session",
+              primaryCandidates: ["Session"],
               lines: [{ type: "progress", label: "Session", scope: "overview" }],
             },
           ]
@@ -1984,6 +2044,9 @@ describe("App", () => {
         iconUrl: "icon-a",
         lines: [{ type: "progress", label: "Session", used: 50, limit: 100, format: { kind: "percent" } }],
       })
+      // Let React commit the result before the debounced tray update reads it; the tray skips
+      // re-applying an unchanged icon, so it must see the new value to redraw.
+      await act(async () => {})
 
       await vi.advanceTimersByTimeAsync(600)
 

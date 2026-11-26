@@ -46,6 +46,10 @@ function filterKnown(ids: string[], descriptors: MetricDescriptor[]): string[] {
   return ids.filter((id) => known.has(id))
 }
 
+function sameIds(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((id, index) => id === b[index])
+}
+
 function defaultMetricOrderByProvider(descriptors: MetricDescriptor[]): Record<string, string[]> {
   const map: Record<string, string[]> = {}
   for (const d of descriptors) {
@@ -129,6 +133,8 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
   },
 
   setTrayFocusProvider: (pluginId) => {
+    // Clicking the card that already drives the tray changes nothing; skip the write.
+    if (get().trayFocusProviderId === pluginId) return
     set({ trayFocusProviderId: pluginId })
     void get().persist()
   },
@@ -199,13 +205,23 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
 
     const defaultOrder = defaultMetricOrderByProvider(descriptors)
     const metricOrderByProvider: Record<string, string[]> = { ...current.metricOrderByProvider }
+    let orderChanged = false
     for (const [pluginId, ids] of Object.entries(defaultOrder)) {
-      const merged = [...(metricOrderByProvider[pluginId] ?? []).filter((id) => known.has(id))]
+      const previous = metricOrderByProvider[pluginId]
+      const merged = [...(previous ?? []).filter((id) => known.has(id))]
       for (const id of ids) {
         if (!merged.includes(id)) merged.push(id)
       }
-      metricOrderByProvider[pluginId] = merged
+      if (!previous || !sameIds(previous, merged)) {
+        metricOrderByProvider[pluginId] = merged
+        orderChanged = true
+      }
     }
+
+    // Runs after every provider result. When nothing about the layout changed, skip the state
+    // update and the disk write: they would re-render the panel and rewrite the settings file
+    // on every refresh for no visible effect.
+    if (!orderChanged && sameIds(pinned, current.pinnedMetricIds)) return
 
     set({ pinnedMetricIds: pinned, metricOrderByProvider })
     void get().persist()

@@ -8,7 +8,12 @@ import { getEnabledPluginIds, getProviderInstanceMeta } from "@/lib/settings"
 import { resolveTrayBarsForLayout } from "@/lib/modern-tray-bars"
 import { parseMetricId } from "@/lib/metric-id"
 
-import { getTrayForegroundHex, renderTrayBarsIcon, type TrayProviderIcon } from "@/lib/tray-bars-icon"
+import {
+  getTrayForegroundHex,
+  renderTrayBarsIcon,
+  type TrayBarsIconArgs,
+  type TrayProviderIcon,
+} from "@/lib/tray-bars-icon"
 import { getTrayIconSizePx } from "@/lib/tray-icon-size"
 import { formatTrayIssuesAppendage } from "@/lib/tray-health"
 import type { TrayPrimaryBar } from "@/lib/tray-primary-progress"
@@ -106,6 +111,7 @@ export function useTrayIcon({
   const trayUpdateTimerRef = useRef<number | null>(null)
   const trayUpdatePendingRef = useRef(false)
   const trayUpdateQueuedRef = useRef(false)
+  const lastAppliedTrayKeyRef = useRef<string | null>(null)
   const [trayReady, setTrayReady] = useState(false)
   const [traySettingsPreview, setTraySettingsPreview] = useState<TraySettingsPreview>(
     EMPTY_TRAY_SETTINGS_PREVIEW
@@ -240,25 +246,45 @@ export function useTrayIcon({
         return Promise.resolve()
       }
 
+      // Every provider result and settings change lands here. Rasterizing the icon and the four
+      // tray IPC calls are the costly part, and most results leave the icon and tooltip exactly as
+      // they were, so apply only when that content changed. A failed apply clears the key so the
+      // next update retries.
+      const applyTrayIfChanged = (key: string, apply: () => Promise<void>) => {
+        if (key === lastAppliedTrayKeyRef.current) {
+          finalizeUpdate()
+          return
+        }
+        apply()
+          .then(() => {
+            lastAppliedTrayKeyRef.current = key
+          })
+          .catch((e) => {
+            lastAppliedTrayKeyRef.current = null
+            console.error("Failed to update tray icon:", e)
+          })
+          .finally(() => {
+            finalizeUpdate()
+          })
+      }
+
       const restoreGaugeIcon = () => {
-        mirrorTrayUsageSummaryToBackend("QuotaBar")
         const gaugePath = trayGaugeIconPathRef.current
-        if (gaugePath) {
-          Promise.all([
+        if (!gaugePath) {
+          mirrorTrayUsageSummaryToBackend("QuotaBar")
+          lastAppliedTrayKeyRef.current = null
+          finalizeUpdate()
+          return
+        }
+        applyTrayIfChanged(JSON.stringify({ gaugePath }), async () => {
+          mirrorTrayUsageSummaryToBackend("QuotaBar")
+          await Promise.all([
             tray.setIcon(gaugePath),
             tray.setIconAsTemplate(true),
             setTrayTitle(""),
             setTrayTooltip("QuotaBar"),
           ])
-            .catch((e) => {
-              console.error("Failed to restore tray gauge icon:", e)
-            })
-            .finally(() => {
-              finalizeUpdate()
-            })
-        } else {
-          finalizeUpdate()
-        }
+        })
       }
 
       const currentSettings = pluginSettingsRef.current
@@ -406,134 +432,43 @@ export function useTrayIcon({
         pluginStates: pluginStatesRef.current,
       })
       const tooltip = issuesLine ? `${tooltipBody}\n${issuesLine}` : tooltipBody
-      mirrorTrayUsageSummaryToBackend(tooltip)
-      const updateTooltip = () => setTrayTooltip(tooltip)
-
-      if (style === "bars") {
-        renderTrayBarsIcon({
-          bars: barsForPreview,
-          sizePx,
-          style: "bars",
-          foregroundHex: ink,
-        })
-          .then(async (img) => {
-            await tray.setIcon(img)
-            await tray.setIconAsTemplate(rasterUsesTemplate)
-            await setTrayTitle("")
-            await updateTooltip()
-          })
-          .catch((e) => {
-            console.error("Failed to update tray icon:", e)
-          })
-          .finally(() => {
-            finalizeUpdate()
-          })
-        return
-      }
-
-      if (style === "logoGrid") {
-        renderTrayBarsIcon({
-          bars: barsForPreview,
-          sizePx,
-          style: "logoGrid",
-          providerIcons: providerIcons,
-          foregroundHex: ink,
-        })
-          .then(async (img) => {
-            await tray.setIcon(img)
-            await tray.setIconAsTemplate(rasterUsesTemplate)
-            await setTrayTitle("")
-            await updateTooltip()
-          })
-          .catch((e) => {
-            console.error("Failed to update tray icon:", e)
-          })
-          .finally(() => {
-            finalizeUpdate()
-          })
-        return
-      }
-
-      if (!trayProviderId) {
+      const providerStyle = style !== "bars" && style !== "logoGrid"
+      if (providerStyle && !trayProviderId) {
         restoreGaugeIcon()
         return
       }
-      lastTrayProviderIdRef.current = trayProviderId
 
+      const iconArgs: TrayBarsIconArgs =
+        style === "bars" || style === "logoGrid"
+          ? {
+              bars: barsForPreview,
+              sizePx,
+              style,
+              providerIcons: style === "logoGrid" ? providerIcons : undefined,
+              foregroundHex: ink,
+            }
+          : style === "donut" || style === "logoBar"
+            ? { bars: providerBars, sizePx, style, providerIconUrl, providerColor, foregroundHex: ink }
+            : {
+                bars: providerBars,
+                sizePx,
+                style: "provider",
+                providerIconUrl,
+                providerColor,
+                percentText: providerPercentText,
+                hideIcon: false,
+                foregroundHex: ink,
+              }
+      const title = iconArgs.style === "provider" ? null : ""
 
-      if (style === "donut") {
-        renderTrayBarsIcon({
-          bars: providerBars,
-          sizePx,
-          style: "donut",
-          providerIconUrl,
-          providerColor,
-          foregroundHex: ink,
-        })
-          .then(async (img) => {
-            await tray.setIcon(img)
-            await tray.setIconAsTemplate(rasterUsesTemplate)
-            await setTrayTitle("")
-            await updateTooltip()
-          })
-          .catch((e) => {
-            console.error("Failed to update tray icon:", e)
-          })
-          .finally(() => {
-            finalizeUpdate()
-          })
-        return
-      }
-
-      if (style === "logoBar") {
-        renderTrayBarsIcon({
-          bars: providerBars,
-          sizePx,
-          style: "logoBar",
-          providerIconUrl: providerIconUrl,
-          providerColor,
-          foregroundHex: ink,
-        })
-          .then(async (img) => {
-            await tray.setIcon(img)
-            await tray.setIconAsTemplate(rasterUsesTemplate)
-            await setTrayTitle("")
-            await updateTooltip()
-          })
-          .catch((e) => {
-            console.error("Failed to update tray icon:", e)
-          })
-          .finally(() => {
-            finalizeUpdate()
-          })
-        return
-      }
-
-      const providerIconUrlToRender = providerIconUrl
-
-      renderTrayBarsIcon({
-        bars: providerBars,
-        sizePx,
-        style: "provider",
-        providerIconUrl: providerIconUrlToRender,
-        providerColor,
-        percentText: providerPercentText,
-        hideIcon: false,
-        foregroundHex: ink,
+      applyTrayIfChanged(JSON.stringify({ iconArgs, title, tooltip }), async () => {
+        mirrorTrayUsageSummaryToBackend(tooltip)
+        const img = await renderTrayBarsIcon(iconArgs)
+        await tray.setIcon(img)
+        await tray.setIconAsTemplate(rasterUsesTemplate)
+        await setTrayTitle(title)
+        await setTrayTooltip(tooltip)
       })
-        .then(async (img) => {
-          await tray.setIcon(img)
-          await tray.setIconAsTemplate(rasterUsesTemplate)
-
-          await setTrayTitle(null)
-          await updateTooltip()
-        })
-        .catch((e) => {
-          console.error("Failed to update tray icon:", e)
-        })
-        .finally(() => {
-          finalizeUpdate()
-        })
     }, delayMs)
   }, [])
 
