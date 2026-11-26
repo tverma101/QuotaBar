@@ -2,7 +2,7 @@ import Foundation
 
 /// Minimal CSV parser supporting quoted fields with embedded commas, newlines, and escaped quotes
 /// (`""` → `"`). Streams records keyed by the header row. Adapted from
-/// `../cursorcat/Sources/CursorCat/API/CSVParser.swift`.
+/// the companion CursorCat CSV parser.
 enum CursorCSVParser {
     struct Summary: Equatable {
         var isStructurallyComplete: Bool

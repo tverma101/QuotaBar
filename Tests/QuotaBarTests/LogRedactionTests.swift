@@ -125,9 +125,9 @@ final class LogRedactionTests: XCTestCase {
     }
 
     func testRedactBodyLoginAndAnalyticsTrackingId() {
-        let body = #"{"login":"robinebers","analytics_tracking_id":"c9df3f012bb8c2eb7aae6868ee8da6cf"}"#
+        let body = #"{"login":"fixture-user","analytics_tracking_id":"c9df3f012bb8c2eb7aae6868ee8da6cf"}"#
         let redacted = LogRedaction.redactBody(body)
-        XCTAssertFalse(redacted.contains("robinebers"), redacted)
+        XCTAssertFalse(redacted.contains("fixture-user"), redacted)
         XCTAssertFalse(redacted.contains("c9df3f012bb8c2eb7aae6868ee8da6cf"), redacted)
         XCTAssertTrue(redacted.contains("[REDACTED]"), redacted)
         XCTAssertTrue(redacted.contains("c9df...a6cf"), redacted)
