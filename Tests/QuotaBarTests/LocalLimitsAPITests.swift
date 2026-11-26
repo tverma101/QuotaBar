@@ -254,7 +254,10 @@ final class LocalLimitsAPITests: XCTestCase {
             "claude": ["session", "weekly", "sonnet", "fable", "extraUsage"],
             "codex": ["session", "weekly", "spark", "sparkWeekly", "credits", "creditValue", "rateLimitResets"],
             "cursor": ["totalUsage", "grokBot", "autoUsage", "apiUsage", "onDemand", "requests", "credits"],
-            "antigravity": ["geminiSession", "geminiWeekly", "argonWeekly", "nonGeminiSession", "nonGeminiWeekly"],
+            // Public builds (which tests are) follow Google's terms and export no Antigravity limits.
+            "antigravity": AntigravityQuotaAccess.current.readsLiveQuota
+                ? ["geminiSession", "geminiWeekly", "argonWeekly", "nonGeminiSession", "nonGeminiWeekly"]
+                : [],
             "copilot": ["premiumCredits", "extraUsage", "orgCredits", "orgSpend", "chat", "completions"],
             "devin": ["daily", "weekly", "extraUsageBalance"],
             "grok": ["weekly"],

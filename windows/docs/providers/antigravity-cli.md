@@ -1,5 +1,14 @@
 # Antigravity CLI
 
+> **Public builds follow Google's terms.** Google's [Antigravity terms](https://antigravity.google/terms/)
+> (section 6) and [FAQ](https://antigravity.google/docs/faq/) do not allow third-party apps to use
+> Antigravity's Google sign-in, call its internal quota service, or wrap `agy`. Public QuotaBar
+> builds therefore show only **Today, Yesterday, Last 30 Days, and Usage Trend** from local
+> Antigravity conversation databases (including T3 Code's private profiles and
+> `~/.config/antigravity/conversations`). They never read the `agy` login, contact Google, or probe the
+> local language server; the plugin host blocks those calls too
+> (`crates/quotabar-core/src/google_terms.rs`). Everything below describes private builds compiled with `QUOTABAR_GOOGLE_PRIVATE_ACCESS=1`.
+
 Tracks Google Antigravity CLI (`agy`) Cloud Code quota.
 
 ## Setup

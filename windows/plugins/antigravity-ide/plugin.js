@@ -169,7 +169,16 @@
 
   // --- Probe ---
 
+  // Public builds follow Google's Antigravity and Gemini terms (see crates/quotabar-core/src/google_terms.rs).
+  // The host enforces the same rule below the plugin; this keeps the message friendly.
+  function hasPrivateGoogleAccess(ctx) {
+    return Boolean(ctx.app && ctx.app.googlePrivateAccess === true)
+  }
+
   function probe(ctx) {
+    if (!hasPrivateGoogleAccess(ctx)) {
+      throw "Antigravity IDE limits come from Antigravity's internal interface, which Google's terms do not allow third-party apps to use. Use the Antigravity provider for local token history."
+    }
     var discovery = discoverLs(ctx)
     if (!discovery) throw "Start Antigravity IDE and try again."
 

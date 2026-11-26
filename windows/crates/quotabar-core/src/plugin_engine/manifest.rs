@@ -62,6 +62,10 @@ pub fn load_plugins_from_dir(plugins_dir: &std::path::Path) -> Vec<LoadedPlugin>
             continue;
         }
         if let Ok(p) = load_single_plugin(&path) {
+            if crate::google_terms::blocks(crate::google_terms::GOOGLE_ONLY_PLUGIN_IDS.contains(&p.manifest.id.as_str())) {
+                log::info!("skipping plugin {}: not available in public builds (Google terms)", p.manifest.id);
+                continue;
+            }
             plugins.push(p);
         }
     }
@@ -316,5 +320,31 @@ mod tests {
         assert_eq!(sanitized.len(), 1);
         assert_eq!(sanitized[0].label, "Status");
         assert_eq!(sanitized[0].url, "https://status.example.com");
+    }
+
+    #[test]
+    fn public_build_skips_google_only_plugins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for id in ["antigravity", "antigravity-ide", "gemini-apps", "claude"] {
+            let plugin_dir = dir.path().join(id);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("plugin.json"),
+                format!(
+                    r#"{{"schemaVersion":1,"id":"{id}","name":"{id}","version":"0.0.1","entry":"plugin.js","icon":"icon.svg","brandColor":null,"lines":[]}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(plugin_dir.join("plugin.js"), "globalThis.__openusage_plugin = {}").unwrap();
+            std::fs::write(plugin_dir.join("icon.svg"), "<svg/>").unwrap();
+        }
+
+        let ids: Vec<_> = load_plugins_from_dir(dir.path())
+            .into_iter()
+            .map(|p| p.manifest.id)
+            .collect();
+
+        // Tests compile as a public build, so only plugins with a terms-compliant data source load.
+        assert_eq!(ids, vec!["antigravity", "claude"]);
     }
 }

@@ -5,7 +5,7 @@ import XCTest
 final class UsageHistoryClassificationTests: XCTestCase {
     func testEverySpendProviderHasOneExplicitHistoryClassification() {
         let descriptorSets = [
-            AntigravityProvider().widgetDescriptors,
+            AntigravityProvider(quotaAccess: .ownerBuild).widgetDescriptors,
             ClaudeProvider().widgetDescriptors,
             CodexProvider().widgetDescriptors,
             CursorProvider().widgetDescriptors,

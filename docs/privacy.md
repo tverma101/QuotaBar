@@ -52,10 +52,22 @@ write only). When a provider refresh rotates a Keychain credential, QuotaBar use
 to add or update the matching item in the current default file-based keychain. Credential writes forbid
 authentication UI; if macOS requires interaction for a write, QuotaBar returns a typed access error
 instead of opening a prompt during token persistence. Cursor token rotation sends its SQLite update on
-the child process's standard input; credential values are not passed as subprocess arguments. Antigravity's
-short-lived refreshed-token cache is tied to the current Keychain login using a one-way fingerprint; the
-refresh credential itself is not copied. The cache is never used after logout, an account change, or
-while Keychain access is unavailable.
+the child process's standard input; credential values are not passed as subprocess arguments.
+
+## Google services
+
+Google's Antigravity and Gemini terms do not allow third-party apps to use their Google sign-in,
+internal quota endpoints, or browser sessions. Public QuotaBar builds — on macOS and Windows — follow
+that: they never read Antigravity's or Gemini's Keychain login, never refresh Google tokens, never probe
+Antigravity's local language server, never read Google browser cookies, and never contact Google's
+Antigravity or Gemini services. Antigravity usage comes only from the conversation history it already
+stores on your computer, and that history never leaves it. On Windows the plugin host refuses these
+operations itself, so a plugin cannot reach them by mistake.
+
+Only a private build that its owner compiles with `QUOTABAR_GOOGLE_PRIVATE_ACCESS=1` reads Antigravity's
+login for live limits. In those builds the short-lived refreshed-token cache is tied to the current
+Keychain login using a one-way fingerprint; the refresh credential itself is not copied. The cache is
+never used after logout, an account change, or while Keychain access is unavailable.
 
 Claude Desktop access is strictly read-only. QuotaBar may ask macOS for permission to use the
 `Claude Safe Storage` Keychain item so it can decrypt Desktop's current access token. It never uses

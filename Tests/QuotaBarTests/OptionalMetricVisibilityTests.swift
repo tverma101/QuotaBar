@@ -5,7 +5,7 @@ import XCTest
 final class OptionalMetricVisibilityTests: XCTestCase {
     func testEveryConditionalProviderRowHidesWithoutDataButHonorsExplicitEnablement() throws {
         let providers: [ProviderRuntime] = [
-            AntigravityProvider(),
+            AntigravityProvider(quotaAccess: .ownerBuild),
             ClaudeProvider(),
             CodexProvider(),
             CopilotProvider(),

@@ -11,6 +11,8 @@ export const makeCtx = () => {
       platform: "darwin",
       appDataDir: "/tmp/openusage-test",
       pluginDataDir: "/tmp/openusage-test/plugin",
+      // Plugin tests exercise the owner build's full behavior; public-build tests set this to false.
+      googlePrivateAccess: true,
     },
     host: {
       fs: {

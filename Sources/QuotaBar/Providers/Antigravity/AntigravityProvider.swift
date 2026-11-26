@@ -4,7 +4,13 @@ import Foundation
 /// fraction-based and shown as up to four percent meters: the shared Gemini pool and the shared
 /// non-Gemini pool (Claude, GPT-OSS), each with a rolling 5-hour and a weekly window.
 ///
-/// Probe order, best source first:
+/// Public builds (`AntigravityQuotaAccess.localHistoryOnly`) show only what Antigravity already wrote
+/// to local disk: token totals, spend estimates, and the usage trend. Google's terms treat third-party
+/// access to Antigravity — its OAuth login, internal endpoints, or local server — as grounds for
+/// suspending the user's account, so the live-limit sources below exist only in owner builds
+/// (see `GoogleTermsPolicy`).
+///
+/// Owner-build probe order, best source first:
 /// 1. Antigravity language server (running app) — richest, gives the authoritative plan.
 /// 2. `agy` language server (running CLI).
 /// 3. Keychain token → Google Cloud Code (works with the app closed); refreshes via Google OAuth.
@@ -22,6 +28,7 @@ final class AntigravityProvider: ProviderRuntime {
     let dbUsageScanner: AntigravityDbUsageScanner
     let now: @Sendable () -> Date
     let pricing: @Sendable () async -> ModelPricing
+    let quotaAccess: AntigravityQuotaAccess
 
     func unloadLocalAccountingCachesForMemoryPressure() async {
         await dbUsageScanner.unloadCachesForMemoryPressure()
@@ -48,8 +55,10 @@ final class AntigravityProvider: ProviderRuntime {
         discovery: LanguageServerDiscovery = LanguageServerDiscovery(),
         dbUsageScanner: AntigravityDbUsageScanner = AntigravityDbUsageScanner(),
         now: @escaping @Sendable () -> Date = Date.init,
-        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() },
+        quotaAccess: AntigravityQuotaAccess = .current
     ) {
+        self.quotaAccess = quotaAccess
         self.authStore = authStore
         self.usageClient = usageClient
         self.discovery = discovery
@@ -59,7 +68,17 @@ final class AntigravityProvider: ProviderRuntime {
     }
 
     var widgetDescriptors: [WidgetDescriptor] {
-        [
+        let history = WidgetDescriptor.usageTrend(provider: provider)
+            .exportingHistory(
+                scope: .machineLocal,
+                estimatedCost: true,
+                sourceNote: Self.usageSourceNote
+            )
+        // A build that cannot read live limits offers no limit rows: they could never show data.
+        guard quotaAccess.readsLiveQuota else {
+            return [history] + WidgetDescriptor.spendTiles(provider: provider)
+        }
+        return [
             .percent(id: AntigravityMetric.geminiID, provider: provider, title: AntigravityMetric.sessionLabel, sessionStartSignal: .zeroUsage)
                 .exportingLimit("geminiSession", unit: "percent"),
             .percent(id: AntigravityMetric.geminiWeeklyID, provider: provider, title: AntigravityMetric.weeklyLabel)
@@ -73,30 +92,37 @@ final class AntigravityProvider: ProviderRuntime {
             .percent(id: AntigravityMetric.claudeWeeklyID, provider: provider, title: AntigravityMetric.claudeWeeklyLabel)
                 .exportingLimit("nonGeminiWeekly", unit: "percent")
                 .hidingWhenEmpty(),
-            .usageTrend(provider: provider)
-                .exportingHistory(
-                    scope: .machineLocal,
-                    estimatedCost: true,
-                    sourceNote: Self.usageSourceNote
-                )
+            history
         ] + WidgetDescriptor.spendTiles(provider: provider)
     }
 
     func hasLocalCredentials() async -> Bool {
+        // Local conversation history is a source in every build, and the only one in public builds.
+        // Listing its directories reads no credentials and contacts nobody.
+        let dbUsageScanner = self.dbUsageScanner
+        let hasHistory = await loadOffMainActor { dbUsageScanner.hasConversationStores() }
+        guard !hasHistory, !Task.isCancelled else { return hasHistory }
+        let access = quotaAccess
+        guard access.readsLiveQuota else { return false }
+
         // A running local server is an independent quota source. Discovery only inspects the local
         // process table and its listening sockets; it never calls Google during first-run seeding.
         let discovery = self.discovery
-        let hasLocalServer = await loadOffMainActor {
-            guard let processSnapshot = discovery.processSnapshot(), !Task.isCancelled else { return false }
-            if discovery.discover(Self.antigravityServerOptions, processSnapshot: processSnapshot) != nil {
-                return true
+        var hasLocalServer = false
+        if access.readsLocalLanguageServer {
+            hasLocalServer = await loadOffMainActor {
+                guard let processSnapshot = discovery.processSnapshot(), !Task.isCancelled else { return false }
+                if discovery.discover(Self.antigravityServerOptions, processSnapshot: processSnapshot) != nil {
+                    return true
+                }
+                guard !Task.isCancelled else { return false }
+                return discovery.discover(Self.agyServerOptions, processSnapshot: processSnapshot) != nil
             }
-            guard !Task.isCancelled else { return false }
-            return discovery.discover(Self.agyServerOptions, processSnapshot: processSnapshot) != nil
         }
 
         // The Keychain login remains the source of truth for Cloud Code. The app-owned access-token
         // cache is derivative and must never independently enable the provider after logout.
+        guard access.usesGoogleCloudCode else { return hasLocalServer }
         do {
             let keychainToken = try await loadOffMainActor { [authStore] in
                 try authStore.loadKeychainToken()
@@ -147,9 +173,22 @@ final class AntigravityProvider: ProviderRuntime {
                 // Fold-only pass (panel phase 2): the meters-only phase just ran the meter strategy;
                 // re-running it per fold would double every panel-open request. The store's merge
                 // recovers the meters and plan onto the fresh DB history.
-                let result = scope.suppressesLiveQuota
-                    ? StrategyResult(plan: nil, lines: [])
-                    : try await probe()
+                let result: StrategyResult
+                if scope.suppressesLiveQuota {
+                    result = StrategyResult(plan: nil, lines: [])
+                } else if quotaAccess.readsLiveQuota {
+                    result = try await probe()
+                } else {
+                    // Public build: no live limits to read. A meter pass only has to report whether
+                    // there is any local history at all; listing directories is the whole cost.
+                    if scope.skipsLocalAccounting {
+                        let dbUsageScanner = self.dbUsageScanner
+                        let hasHistory = await loadOffMainActor { dbUsageScanner.hasConversationStores() }
+                        try Task.checkCancellation()
+                        guard hasHistory else { throw AntigravityError.noLocalHistory }
+                    }
+                    result = StrategyResult(plan: nil, lines: [])
+                }
                 try Task.checkCancellation()
 
                 // Meters-only passes (menu-bar ticks, panel phase 1) only need the live quota meters.
@@ -169,6 +208,9 @@ final class AntigravityProvider: ProviderRuntime {
 
                 let history = await historyTask?.value
                 try Task.checkCancellation()
+                if !quotaAccess.readsLiveQuota, history == nil {
+                    throw AntigravityError.noLocalHistory
+                }
                 var lines = result.lines
                 if let history {
                     lines.append(contentsOf: history.lines)

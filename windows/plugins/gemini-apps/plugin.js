@@ -403,7 +403,16 @@
     return { html: html, meta: meta }
   }
 
+  // Public builds follow Google's Antigravity and Gemini terms (see crates/quotabar-core/src/google_terms.rs).
+  // The host enforces the same rule below the plugin; this keeps the message friendly.
+  function hasPrivateGoogleAccess(ctx) {
+    return Boolean(ctx.app && ctx.app.googlePrivateAccess === true)
+  }
+
   function probe(ctx) {
+    if (!hasPrivateGoogleAccess(ctx)) {
+      throw "Gemini Apps usage needs your Google browser session, which Google's terms do not allow third-party apps to use."
+    }
     const cookies = loadCookies(ctx)
     if (!cookies) {
       throw "Gemini Apps auth missing. Log into gemini.google.com in Chrome, or paste a session cookie in Set credentials."

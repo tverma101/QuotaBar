@@ -20,6 +20,10 @@
   var FETCH_MODELS_PATH = "/v1internal:fetchAvailableModels"
   var RETRIEVE_QUOTA_PATH = "/v1internal:retrieveUserQuota"
   var LOGIN_MESSAGE = "Start Antigravity or run `agy` and try again."
+  var LOCAL_HISTORY_MESSAGE =
+    "No Antigravity usage found yet. QuotaBar counts tokens from Antigravity's local conversation history."
+  var PUBLIC_ACCOUNT_MESSAGE =
+    "Extra Antigravity accounts need Antigravity's Google sign-in, which Google's terms do not allow third-party apps to use."
   var GOOGLE_OAUTH_URL = "https://oauth2.googleapis.com/token"
   var GOOGLE_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
   var GOOGLE_CLIENT_SECRET = "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"
@@ -1006,9 +1010,23 @@
 
   // --- Probe ---
 
+  // Public builds follow Google's Antigravity and Gemini terms (see crates/quotabar-core/src/google_terms.rs).
+  // The host enforces the same rule below the plugin; this keeps the message friendly.
+  function hasPrivateGoogleAccess(ctx) {
+    return Boolean(ctx.app && ctx.app.googlePrivateAccess === true)
+  }
+
+  // Public builds never read Antigravity's Google login, query its local language server, or call
+  // Google's internal endpoints. They show only the token history Antigravity already wrote to disk.
   function probe(ctx) {
-    var injected = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
     var account = ctx.account
+    if (!hasPrivateGoogleAccess(ctx)) {
+      if (account && account.instanceId !== account.baseProviderId) throw PUBLIC_ACCOUNT_MESSAGE
+      var local = attachLocalSpend(ctx, { plan: null, lines: [] }, "Antigravity")
+      if (!local.lines.length) throw LOCAL_HISTORY_MESSAGE
+      return local
+    }
+    var injected = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
     var isolated = Boolean(injected || (account && account.instanceId !== account.baseProviderId))
     var result = probeQuota(ctx, injected, isolated)
     return isolated ? result : attachLocalSpend(ctx, result, "Antigravity")

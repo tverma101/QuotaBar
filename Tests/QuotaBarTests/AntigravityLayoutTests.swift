@@ -147,5 +147,5 @@ final class AntigravityLayoutTests: XCTestCase {
 private extension WidgetRegistry {
     /// A registry with just the live Antigravity provider, so `DefaultLayout` seeds its metrics only.
     @MainActor
-    static var antigravityOnly: WidgetRegistry { .from([AntigravityProvider()]) }
+    static var antigravityOnly: WidgetRegistry { .from([AntigravityProvider(quotaAccess: .ownerBuild)]) }
 }

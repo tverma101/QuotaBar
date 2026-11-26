@@ -400,7 +400,8 @@ final class AntigravityProviderTests: XCTestCase {
                 authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
                 usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
                 discovery: LanguageServerDiscovery(processRunner: LocalCredentialProcessRunner(command: command)),
-                dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+                dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+                quotaAccess: .ownerBuild
             )
 
             let detected = await provider.hasLocalCredentials()
@@ -418,7 +419,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: CountingProcessRunner(psCalls: psCalls)),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         let detected = await provider.hasLocalCredentials()
@@ -434,7 +436,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: CountingProcessRunner(psCalls: psCalls)),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         _ = await provider.refresh()
@@ -456,7 +459,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: CancellationKeychain(), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         let detected = await provider.hasLocalCredentials()
@@ -483,7 +487,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
     }
 
@@ -538,7 +543,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         let refresh = Task { await provider.refresh() }
@@ -618,7 +624,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: authStore,
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         let snapshot = await provider.refresh()
@@ -654,7 +661,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: authStore,
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         let snapshot = await provider.refresh()
@@ -685,7 +693,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: authStore,
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         _ = await provider.refresh()
@@ -731,7 +740,8 @@ final class AntigravityProviderTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: keychain, files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         let refresh = Task { @MainActor in await provider.refresh() }
@@ -783,7 +793,8 @@ final class AntigravityProviderTests: XCTestCase {
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
             dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
-            now: { now }
+            now: { now },
+            quotaAccess: .ownerBuild
         )
 
         let refresh = Task { @MainActor in await provider.refresh() }
@@ -835,7 +846,8 @@ final class AntigravityProviderTests: XCTestCase {
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
             dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
-            now: { now }
+            now: { now },
+            quotaAccess: .ownerBuild
         )
 
         let refresh = Task { @MainActor in await provider.refresh() }
@@ -906,7 +918,8 @@ final class AntigravityProviderTests: XCTestCase {
                 usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
                 discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
                 dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
-                now: { now }
+                now: { now },
+                quotaAccess: .ownerBuild
             )
             let refresh = Task { @MainActor in await provider.refresh() }
 
@@ -1228,7 +1241,8 @@ extension AntigravityProviderTests {
             authStore: AntigravityAuthStore(keychain: keychain, files: FakeFiles([:])),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
 
         let snapshots = await ProviderRefreshContext.$isManual.withValue(false) {

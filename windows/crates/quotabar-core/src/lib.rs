@@ -3,6 +3,7 @@
 pub mod paths;
 pub mod plugin_engine;
 pub mod chromium_cookies;
+pub mod google_terms;
 mod provider_accounts_crypto;
 pub mod provider_accounts;
 pub mod codex_accounts;

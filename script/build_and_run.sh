@@ -19,6 +19,10 @@ set -euo pipefail
 #                           with the production app identity; install preserves the destination identity
 #        ICLOUD_PROVISIONING_PROFILE  optional override for the development provisioning profile;
 #                         otherwise the newest matching installed profile is selected automatically
+#        QUOTABAR_GOOGLE_PRIVATE_ACCESS  "1" builds a private owner binary that reads Antigravity's
+#                         live limits (local language server, Keychain login, Google Cloud Code).
+#                         Google's terms prohibit that for third-party apps, so it is off by default
+#                         and refused with RELEASE=1. See docs/providers/antigravity.md.
 
 MODE="${1:-run}"
 CONFIG="${CONFIG:-release}"
@@ -41,6 +45,16 @@ BUNDLE_ID="${BUNDLE_ID:-$DEFAULT_BUNDLE_ID}"
 ICLOUD_CONTAINER_ID="${ICLOUD_CONTAINER_ID:-iCloud.$BUNDLE_ID}"
 MIN_SYSTEM_VERSION="15.0"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+QUOTABAR_GOOGLE_PRIVATE_ACCESS="${QUOTABAR_GOOGLE_PRIVATE_ACCESS:-0}"
+SWIFT_BUILD_FLAGS=()
+if [ "$QUOTABAR_GOOGLE_PRIVATE_ACCESS" = "1" ]; then
+  if [ "$RELEASE" = "1" ]; then
+    echo "QUOTABAR_GOOGLE_PRIVATE_ACCESS=1 cannot be combined with RELEASE=1: public builds must follow Google's terms" >&2
+    exit 1
+  fi
+  echo "==> private owner build: Antigravity live limits enabled (not for distribution)"
+  SWIFT_BUILD_FLAGS+=(-Xswiftc -DQUOTABAR_GOOGLE_PRIVATE_ACCESS)
+fi
 if [ "$RELEASE" = "1" ]; then
   RELEASE_TAG="$(git -C "$ROOT_DIR" describe --exact-match --tags HEAD 2>/dev/null || true)"
   if [[ "$RELEASE_TAG" != v* ]]; then
@@ -206,8 +220,8 @@ if [ "$RELEASE" = "1" ]; then
   RESOURCE_BUILD_DIR="$ARM64_BUILD_DIR"
 else
   echo "==> swift build ($CONFIG, $BUILD_JOBS jobs, index store disabled)"
-  swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store
-  BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store --show-bin-path)"
+  swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store ${SWIFT_BUILD_FLAGS[@]+"${SWIFT_BUILD_FLAGS[@]}"}
+  BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store ${SWIFT_BUILD_FLAGS[@]+"${SWIFT_BUILD_FLAGS[@]}"} --show-bin-path)"
   BUILD_BINARY="$BUILD_DIR/$TARGET_NAME"
   BUILD_CLI_BINARY="$BUILD_DIR/quotabar-cli"
   RESOURCE_BUILD_DIR="$BUILD_DIR"
