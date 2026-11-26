@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { ChevronDown, History, Info, Loader2, Power, Settings, SlidersHorizontal } from "lucide-react"
 import { AboutDialog } from "@/components/about-dialog"
+import { UpdateStatusLabel } from "@/components/update-status-label"
+import type { UpdateStatus } from "@/hooks/use-app-update"
 import { useNowTicker } from "@/hooks/use-now-ticker"
 import { cn } from "@/lib/utils"
 
 type ModernFooterProps = {
   version: string
   autoUpdateNextAt: number | null
+  updateStatus: UpdateStatus
+  onUpdateInstall: () => void
+  onUpdateCheck: () => void
   refreshing: boolean
   onRefreshAll: () => void
   showAbout: boolean
@@ -30,6 +35,9 @@ export function nextUpdateLabel(autoUpdateNextAt: number | null, now: number): s
 export function ModernFooter({
   version,
   autoUpdateNextAt,
+  updateStatus,
+  onUpdateInstall,
+  onUpdateCheck,
   refreshing,
   onRefreshAll,
   showAbout,
@@ -48,13 +56,13 @@ export function ModernFooter({
     <>
       <footer className="flex h-[52px] shrink-0 items-center justify-between gap-3 border-t border-hairline bg-chrome pl-[14px] pr-[12px]">
         <div className="flex min-w-0 flex-col items-start text-[12px] leading-[1.3] text-foreground/80">
-          <button
-            type="button"
-            onClick={onShowAbout}
-            className="truncate rounded-[4px] outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            QuotaBar {version}
-          </button>
+          <UpdateStatusLabel
+            version={version}
+            updateStatus={updateStatus}
+            onUpdateInstall={onUpdateInstall}
+            onUpdateCheck={onUpdateCheck}
+            onShowAbout={onShowAbout}
+          />
           <button
             type="button"
             disabled={refreshing}

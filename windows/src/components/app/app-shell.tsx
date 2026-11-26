@@ -13,6 +13,8 @@ import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import { useAppVersion } from "@/hooks/app/use-app-version"
 import { usePanel } from "@/hooks/app/use-panel"
 import { usePlatform } from "@/hooks/app/use-platform"
+import { useTrayRestartBridge } from "@/hooks/app/use-tray-restart-bridge"
+import type { UpdateStatus } from "@/hooks/use-app-update"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 import { useAppUiStore } from "@/stores/app-ui-store"
 import { useMotionPointer } from "@/hooks/app/use-motion-pointer"
@@ -28,6 +30,9 @@ type AppShellProps = {
   onPluginContextAction: (pluginId: string, action: PluginContextAction) => void
   isPluginRefreshAvailable: (pluginId: string) => boolean
   onNavReorder: (orderedIds: string[]) => void
+  updateStatus: UpdateStatus
+  onUpdateInstall: () => void
+  onUpdateCheck: () => void
   appContentProps: AppContentActionProps
 
   showOnboardingWizard: boolean
@@ -45,6 +50,9 @@ export function AppShell({
   onPluginContextAction,
   isPluginRefreshAvailable,
   onNavReorder,
+  updateStatus,
+  onUpdateInstall,
+  onUpdateCheck,
   appContentProps,
   showOnboardingWizard,
   onOnboardingComplete,
@@ -82,6 +90,7 @@ export function AppShell({
   })
 
   const appVersion = useAppVersion()
+  useTrayRestartBridge(updateStatus, onUpdateInstall)
   const platform = usePlatform()
   // macOS and Windows run the same frameless tray popover (borderless window,
   // click-away dismiss); Linux keeps the native-title-bar layout.
@@ -221,6 +230,9 @@ export function AppShell({
             <PanelFooter
               version={appVersion}
               autoUpdateNextAt={autoUpdateNextAt}
+              updateStatus={updateStatus}
+              onUpdateInstall={onUpdateInstall}
+              onUpdateCheck={onUpdateCheck}
               onRefreshAll={onRefreshAll}
               showAbout={showAbout}
               onShowAbout={() => setShowAbout(true)}

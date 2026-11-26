@@ -1,0 +1,85 @@
+name: Update Feed
+
+# Publishes the signed Windows update feed that installed QuotaBar apps check. It runs only when the
+# owner publishes a GitHub release (drafts never reach users) or re-runs it by hand for a tag. The
+# installer signature comes from the tagged Windows CI build; this job never sees the signing key.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to offer as the latest update (for example v0.7.3)
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-feed
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Publish Windows Update Feed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      FEED_BRANCH: update-feed
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check Release
+        id: release
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
+            echo "::error::Not a QuotaBar release tag: $TAG"; exit 1
+          fi
+          if [ "$(gh release view "$TAG" -R "$REPO" --json isDraft --jq .isDraft)" != "false" ]; then
+            echo "::error::$TAG is not a published release"; exit 1
+          fi
+          installer="QuotaBar_${TAG#v}_x64-setup.exe"
+          assets="$(gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name')"
+          if ! grep -qxF "$installer" <<<"$assets"; then
+            echo "::notice::$TAG has no $installer, so the Windows feed is unchanged."
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! grep -qxF "$installer.sig" <<<"$assets"; then
+            echo "::error::$TAG is missing $installer.sig. Attach the signature from the tagged Windows CI artifact."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh release download "$TAG" -R "$REPO" -p "$installer.sig" -D "$RUNNER_TEMP/assets"
+          echo "signature=$RUNNER_TEMP/assets/$installer.sig" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Write Feed
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          feed="$RUNNER_TEMP/feed"
+          if git fetch --depth=1 origin "$FEED_BRANCH"; then
+            git worktree add --detach "$feed" FETCH_HEAD
+          else
+            git worktree add --detach "$feed"
+            git -C "$feed" switch --orphan "$FEED_BRANCH"
+            printf '%s\n' "# QuotaBar Update Feed" "" \
+              "Written by the Update Feed workflow. Installed apps read windows/latest.json." > "$feed/README.md"
+          fi
+          mkdir -p "$feed/windows"
+          node windows/scripts/update-feed.mjs \
+            --tag "$TAG" --repo "$REPO" \
+            --signature-file "${{ steps.release.outputs.signature }}" \
+            --current "$feed/windows/latest.json" \
+            --out "$feed/windows/latest.json"
+          cd "$feed"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Feed unchanged."; exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Offer $TAG to Windows updates"
+          git push origin "HEAD:$FEED_BRANCH"

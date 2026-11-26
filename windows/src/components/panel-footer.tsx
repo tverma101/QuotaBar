@@ -1,11 +1,16 @@
 import { useMemo } from "react";
 import { AboutDialog } from "@/components/about-dialog";
 import { fireMotionShock } from "@/components/motion-field";
+import { UpdateStatusLabel } from "@/components/update-status-label";
+import type { UpdateStatus } from "@/hooks/use-app-update";
 import { useNowTicker } from "@/hooks/use-now-ticker";
 
 interface PanelFooterProps {
   version: string;
   autoUpdateNextAt: number | null;
+  updateStatus: UpdateStatus;
+  onUpdateInstall: () => void;
+  onUpdateCheck: () => void;
   onRefreshAll?: () => void;
   showAbout: boolean;
   onShowAbout: () => void;
@@ -17,6 +22,9 @@ interface PanelFooterProps {
 export function PanelFooter({
   version,
   autoUpdateNextAt,
+  updateStatus,
+  onUpdateInstall,
+  onUpdateCheck,
   onRefreshAll,
   showAbout,
   onShowAbout,
@@ -42,13 +50,14 @@ export function PanelFooter({
   return (
     <>
       <div className="flex justify-between items-center h-8 pt-1.5 border-t">
-        <button
-          type="button"
-          onClick={onShowAbout}
-          className="text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-        >
-          QuotaBar {version}
-        </button>
+        <UpdateStatusLabel
+          version={version}
+          updateStatus={updateStatus}
+          onUpdateInstall={onUpdateInstall}
+          onUpdateCheck={onUpdateCheck}
+          onShowAbout={onShowAbout}
+          className="text-xs text-muted-foreground cursor-pointer"
+        />
         <div className="flex items-center gap-2">
           {autoUpdateNextAt !== null && onRefreshAll ? (
             <button

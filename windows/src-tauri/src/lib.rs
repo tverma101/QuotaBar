@@ -1457,6 +1457,7 @@ pub fn run() {
                 .level_for("hyper", log::LevelFilter::Warn)
                 .level_for("reqwest", log::LevelFilter::Warn)
                 .level_for("tao", log::LevelFilter::Info)
+                .level_for("tauri_plugin_updater", log::LevelFilter::Info)
                 .build(),
         )
         .plugin(tauri_plugin_process::init())
@@ -1570,6 +1571,12 @@ pub fn run() {
                     log::info!("startHidden is set; leaving the main window in the tray");
                 }
             }
+
+            // Signed updates come from QuotaBar's own GitHub feed (see docs/releasing.md). Only the
+            // Windows installer is published there, so other platforms skip the network check.
+            #[cfg(target_os = "windows")]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
 
             // Register global shortcut from stored settings
             #[cfg(desktop)]

@@ -15,6 +15,7 @@ import { useSettingsTheme } from "@/hooks/app/use-settings-theme"
 import { useReduceAnimations } from "@/hooks/app/use-reduce-animations"
 import { useSettingsUIScale } from "@/hooks/app/use-settings-ui-scale"
 import { useTrayIcon } from "@/hooks/app/use-tray-icon"
+import { useAppUpdate } from "@/hooks/use-app-update"
 import { useUsageAlert } from "@/hooks/app/use-usage-alert"
 import { useNotificationFocus } from "@/hooks/app/use-notification-focus"
 import { usePanelHideReset } from "@/hooks/app/use-panel-hide-reset"
@@ -180,6 +181,7 @@ function App() {
   const pluginSettingsRef = useRef(pluginSettings)
   pluginSettingsRef.current = pluginSettings
 
+  const { updateStatus, triggerInstall, checkForUpdates } = useAppUpdate()
 
   const { scheduleTrayIconUpdate, traySettingsPreview } = useTrayIcon({
     pluginsMeta,
@@ -659,6 +661,9 @@ function App() {
     displayPlugins,
     settingsPlugins,
     autoUpdateNextAt,
+    updateStatus,
+    onUpdateInstall: triggerInstall,
+    onUpdateCheck: checkForUpdates,
     showOnboardingWizard,
     onOnboardingComplete: handleOnboardingComplete,
     onOnboardingSkip: handleOnboardingSkip,

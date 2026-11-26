@@ -11,7 +11,7 @@ QuotaBar shows AI coding subscription limits, reset times, credits, and spend in
 3. Open **Options → Customize** in Modern or **Options → Settings → Providers** in Classic to change which providers are tracked. Claude, Codex, Cursor, and Freebuff start enabled. Sign in through the relevant provider tool if a card needs credentials.
 4. Set **Start on Login** or **Start Hidden** under **Advanced**. Usage normally refreshes every 15 minutes, including when the panel is closed.
 
-To update, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account. Your selected dashboard layout and provider settings carry over.
+QuotaBar updates itself. It checks this repository's signed release feed, downloads new releases in the background, and shows **Ready to update** in the footer. Click it, or choose **Restart to update** from the tray menu, to install. Your selected dashboard layout and provider settings carry over. Versions before the first updater release need one manual update. Open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account.
 
 New profiles open in **Modern**. Use **Options → Usage History** for local totals after enabling **Save usage snapshots after successful refreshes** under **Settings → Advanced**. Change layouts in **Settings → Look → UI layout**.
 

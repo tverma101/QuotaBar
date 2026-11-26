@@ -39,9 +39,10 @@ git --no-pager diff --stat 3866cd1 -- /tmp/openusage-upstream   # compare trees
 Local changes that matter when syncing shared code:
 
 1. **Sparkle auto-updates removed** (`5818ab1`). Sparkle fetches its appcast and DMGs anonymously,
-   through an upstream-owned, signed update feed. QuotaBar now has a public repository but no
-   QuotaBar-owned feed or release-signing pipeline, so its updater, Settings section, dashboard banner,
-   release workflow and GitHub Pages workflows remain removed. Releases are manual.
+   through an upstream-owned, signed update feed. The macOS app has no QuotaBar-owned feed or signed
+   DMG yet, so its updater, Settings section, dashboard banner, release workflow and GitHub Pages
+   workflows remain removed, and macOS releases are manual. The Windows app has its own signed Tauri
+   updater fed from this repository's `update-feed` branch (see `docs/releasing.md`).
 2. **Rebrand to QuotaBar** (`17776c5`). Required by `TRADEMARK.md`. Build identity, user-facing
    strings, on-disk paths and the bundle id all changed. Internal symbols (`OpenUsageISO8601`,
    `Bundle.openUsageResources`) were left alone deliberately, to keep the upstream diff small.
