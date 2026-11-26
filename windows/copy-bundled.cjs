@@ -3,6 +3,13 @@ const { join } = require("path")
 
 const root = __dirname
 const exclude = new Set(["mock"])
+// Google's Antigravity and Gemini terms forbid third-party apps from using their sign-in, internal
+// endpoints, or browser sessions. These plugins have no other data source, so public builds omit them.
+// A private owner build opts in with QUOTABAR_GOOGLE_PRIVATE_ACCESS=1 (see crates/quotabar-core/src/google_terms.rs).
+if (process.env.QUOTABAR_GOOGLE_PRIVATE_ACCESS !== "1") {
+  exclude.add("antigravity-ide")
+  exclude.add("gemini-apps")
+}
 const srcDir = join(root, "plugins")
 const dstDir = join(root, "src-tauri", "resources", "bundled_plugins")
 

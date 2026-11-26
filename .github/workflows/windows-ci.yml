@@ -40,6 +40,14 @@ jobs:
           workspaces: windows
           cache-bin: false
 
+      - name: Refuse Private Google Builds
+        shell: pwsh
+        run: |
+          # Public installers must follow Google's Antigravity and Gemini terms (see AGENTS.md).
+          if ($env:QUOTABAR_GOOGLE_PRIVATE_ACCESS) {
+            throw "QUOTABAR_GOOGLE_PRIVATE_ACCESS is for private owner builds and must not be set in CI."
+          }
+
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
 

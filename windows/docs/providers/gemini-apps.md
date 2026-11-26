@@ -1,5 +1,10 @@
 # Gemini Apps
 
+> **Not included in public builds.** It reads your gemini.google.com browser session. Google's terms do not allow third-party apps to use
+> that, and this provider has no other data source, so public QuotaBar builds do not ship it (the
+> plugin host skips it and `copy-bundled.cjs` leaves it out). It exists only in private builds
+> compiled with `QUOTABAR_GOOGLE_PRIVATE_ACCESS=1`.
+
 > Tracks Gemini consumer **Current** and **Weekly** usage from [gemini.google.com/usage](https://gemini.google.com/usage).
 
 This is **not** Antigravity / Gemini CLI coding quota. Those stay on the Antigravity plugins.

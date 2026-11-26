@@ -1,5 +1,10 @@
 # Antigravity IDE
 
+> **Not included in public builds.** Its limits come only from Antigravity IDE's internal language server. Google's terms do not allow third-party apps to use
+> that, and this provider has no other data source, so public QuotaBar builds do not ship it (the
+> plugin host skips it and `copy-bundled.cjs` leaves it out). It exists only in private builds
+> compiled with `QUOTABAR_GOOGLE_PRIVATE_ACCESS=1`. For token history, use the Antigravity provider, which reads the IDE's local conversations.
+
 > Antigravity IDE is the standalone 2.0 version of [Antigravity](antigravity.md). Shares the same Codeium language server binary and Connect-RPC protocol.
 
 ## Overview

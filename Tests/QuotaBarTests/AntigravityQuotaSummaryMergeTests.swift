@@ -129,7 +129,8 @@ final class AntigravityQuotaSummaryMergeTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain("go-keyring-base64:" + Data(token.utf8).base64EncodedString()), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: MergeNoProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-merge-test" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-merge-test" }),
+            quotaAccess: .ownerBuild
         )
         let snapshot = await ProviderRefreshContext.$scope.withValue(.menuBar) { await provider.refresh() }
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"])

@@ -6,6 +6,8 @@ import Foundation
 enum AntigravityError: Error, LocalizedError, Equatable {
     /// No usable credentials anywhere (no LS running, no keychain token, nothing cached).
     case notSignedIn
+    /// Public builds read only local conversation history, and none was found.
+    case noLocalHistory
     /// The Keychain credential may exist, but macOS would not let QuotaBar read it.
     case credentialStoreUnreadable
     /// The Keychain item needs user interaction to release. Distinct from `credentialStoreUnreadable`
@@ -30,6 +32,8 @@ enum AntigravityError: Error, LocalizedError, Equatable {
         switch self {
         case .notSignedIn:
             return "Start Antigravity or run `agy` and try again."
+        case .noLocalHistory:
+            return "No Antigravity usage found yet. QuotaBar counts tokens from Antigravity’s local conversation history."
         case .credentialStoreUnreadable:
             return "Couldn't read Antigravity credentials from Keychain. Unlock Keychain or sign in to Antigravity again."
         case .credentialPermissionRequired:

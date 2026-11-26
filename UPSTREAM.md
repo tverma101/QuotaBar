@@ -66,6 +66,16 @@ Local changes that matter when syncing shared code:
    and deduplicates migrated IDs. Reasoning-only Router records keep their measured lower bound
    without blocking independent OpenCode history. Completed Router prefixes remain usable through ordinary appends during the wider fold; rewrites and replacements still invalidate them. Preserve these format-compatibility fixes.
 
+5. **Google-terms build gate for Antigravity and Gemini.** Upstream still reads Antigravity's Google
+   login and calls Cloud Code. Google's Antigravity terms (section 6) and FAQ forbid third-party apps
+   from doing that, so public QuotaBar builds read only local conversation history and omit the limit
+   meters. Live limits compile in only with `QUOTABAR_GOOGLE_PRIVATE_ACCESS` (Swift flag / Rust
+   `option_env!`), which `build_and_run.sh` refuses for releases. On Windows the plugin host also
+   blocks Google OAuth, Cloud Code and gemini.google.com requests, Antigravity Keychain and language
+   server access, and Google cookies, and skips the `antigravity-ide` and `gemini-apps` plugins. When
+   syncing upstream Antigravity or Gemini changes, keep new Google access behind this gate
+   (`GoogleTermsPolicy`, `AntigravityQuotaAccess`, `google_terms.rs`).
+
 ## Selective sync — 2026-10-21
 
 Compared upstream `26132ff48d` (2026-10-18). Adapted these improvements without importing upstream branding, updates, provider activation, or pricing policy:

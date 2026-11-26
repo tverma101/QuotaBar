@@ -1967,7 +1967,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
             dbUsageScanner: scanner,
             now: { fixedNow },
-            pricing: { fixedPricing }
+            pricing: { fixedPricing },
+            quotaAccess: .ownerBuild
         )
 
         let snapshot = await provider.refresh()
@@ -1992,6 +1993,42 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         XCTAssertEqual(total.totalUSD, 3, accuracy: 0.000_001)
         XCTAssertEqual(total.totalTokens, 1_500_000)
         XCTAssertTrue(total.isEstimated)
+    }
+
+    @MainActor
+    func testPublicBuildShowsConversationSpendWithoutAnyLiveQuotaSource() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let fixedNow = now
+        let fixedPricing = pricing
+        let timestamp = UInt64(fixedNow.timeIntervalSince1970) - 3_600
+        let blob = antigravityGenerationBlob(
+            model: "gemini-3.6-flash",
+            input: 1_000_000,
+            output: 500_000,
+            timestamp: timestamp
+        )
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [.init(index: 0, blob: blob)]])
+        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
+        let credentials = #"{"token":{"access_token":"ya29.test","refresh_token":"1//test","expiry":"2099-01-01T00:00:00Z"}}"#
+        let keychain = FakeKeychain("go-keyring-base64:" + Data(credentials.utf8).base64EncodedString())
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: keychain, files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path }),
+            now: { fixedNow },
+            pricing: { fixedPricing },
+            quotaAccess: .localHistoryOnly
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertNil(snapshot.warning)
+        XCTAssertEqual(snapshot.lines.map(\.label), ["Today", "Last 30 Days", "Usage Trend"])
+        let todayKey = DailyUsageAccumulator.dayKey(from: fixedNow)
+        XCTAssertEqual(snapshot.usageHistory?.series.daily.first { $0.date == todayKey }?.totalTokens, 1_500_000)
+        XCTAssertTrue(http.requests.isEmpty, "public builds never call Google, Antigravity, or loopback endpoints")
     }
 
     @MainActor
@@ -2024,7 +2061,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
             dbUsageScanner: scanner,
             now: { fixedNow },
-            pricing: { fixedPricing }
+            pricing: { fixedPricing },
+            quotaAccess: .ownerBuild
         )
 
         let snapshot = await provider.refresh()
@@ -2060,7 +2098,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
             dbUsageScanner: scanner,
             now: { fixedNow },
-            pricing: { fixedPricing }
+            pricing: { fixedPricing },
+            quotaAccess: .ownerBuild
         )
 
         let snapshot = await provider.refresh()
@@ -2088,7 +2127,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
             now: { fixedNow },
-            pricing: { fixedPricing }
+            pricing: { fixedPricing },
+            quotaAccess: .ownerBuild
         )
         let previous = ProviderSnapshot(
             providerID: "antigravity",

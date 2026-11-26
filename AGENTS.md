@@ -26,6 +26,12 @@ hand with `./script/build_and_run.sh build`.
   QuotaBar-owned release and signing process.
 - iCloud Sync is inert: its container must be registered in the owner's Apple Developer team first.
   Do not treat the Settings section as a working feature.
+- **Public builds follow Google's Antigravity and Gemini terms.** They read only local Antigravity
+  conversation history. Never add a public-build path that reads Antigravity/Gemini/`agy` logins,
+  refreshes Google tokens, probes Antigravity's language server, wraps `agy`, reads Google browser
+  cookies, or calls Cloud Code, Google OAuth, or gemini.google.com. Such access belongs only behind
+  `QUOTABAR_GOOGLE_PRIVATE_ACCESS` (`GoogleTermsPolicy` / `AntigravityQuotaAccess` on macOS,
+  `google_terms.rs` on Windows), which release builds refuse. See `docs/providers/antigravity.md`.
 
 ## Architecture
 

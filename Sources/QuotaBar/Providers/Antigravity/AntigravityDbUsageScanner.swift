@@ -80,16 +80,19 @@ actor AntigravityDbUsageScanner {
         )
     }
 
-    /// Antigravity keeps separate local conversation stores for the app, IDE, CLI, and compatible
-    /// clients. Discover every sibling root so installing a different Antigravity client does not
-    /// leave its local spend and trend rows empty.
+    /// Antigravity keeps separate local conversation stores for the app, IDE, CLI, compatible
+    /// clients, and T3 Code's private ACP instances. Discover every root so a different Antigravity
+    /// client does not leave its local spend and trend rows empty (see `AntigravityConversationRoots`).
     static let defaultConversationDiscovery: @Sendable () throws -> ConversationDirectoryDiscovery = {
-        let geminiRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini", isDirectory: true)
-        do {
-            return try discoverConversationDirectories(in: geminiRoot)
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return ConversationDirectoryDiscovery(directories: [], failures: [:])
+        AntigravityConversationRoots.discover(home: FileManager.default.homeDirectoryForCurrentUser)
+    }
+
+    /// Whether any conversation database exists. Only lists directories: it opens no database and is
+    /// cheap enough for first-run setup detection.
+    nonisolated func hasConversationStores() -> Bool {
+        guard let discovery = try? discoverConversationDirectories() else { return false }
+        return discovery.directories.contains { directory in
+            (try? Self.databaseFiles(in: directory).isEmpty == false) ?? false
         }
     }
 

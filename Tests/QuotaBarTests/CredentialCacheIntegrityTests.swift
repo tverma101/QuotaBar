@@ -312,7 +312,8 @@ final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: CredentialEmptyProcessRunner()),
             dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
-            now: { fixedNow }
+            now: { fixedNow },
+            quotaAccess: .ownerBuild
         )
     }
 

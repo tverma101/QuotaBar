@@ -91,7 +91,7 @@ final class ResetDisplayTests: XCTestCase {
         // utilization reads 0 for an in-flight window under 1%, so `.zeroUsage` would regress #1160.
         let providers: [ProviderRuntime] = [
             ClaudeProvider(), CodexProvider(), CursorProvider(),
-            AntigravityProvider(), CopilotProvider(), DevinProvider(),
+            AntigravityProvider(quotaAccess: .ownerBuild), CopilotProvider(), DevinProvider(),
             GrokProvider(), OpenRouterProvider(), ZAIProvider(), OpenCodeProvider()
         ]
         let descriptors = providers.flatMap(\.widgetDescriptors)

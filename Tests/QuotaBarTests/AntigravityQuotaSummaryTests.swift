@@ -232,7 +232,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
     @MainActor
     func testDescriptorLabelsMatchMapperEmittedLabels() {
         let descriptorLabels = Set(
-            AntigravityProvider().widgetDescriptors
+            AntigravityProvider(quotaAccess: .ownerBuild).widgetDescriptors
                 .filter { !$0.limitResources.isEmpty }
                 .map(\.metricLabel)
         )
@@ -261,7 +261,8 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: NoProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
     }
 
@@ -366,7 +367,8 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: NoProcessRunner()),
-            dbUsageScanner: scanner
+            dbUsageScanner: scanner,
+            quotaAccess: .ownerBuild
         )
 
         let snapshot = await provider.refresh()
@@ -436,7 +438,8 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
             authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: FakeLSProcessRunner()),
-            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            quotaAccess: .ownerBuild
         )
     }
 

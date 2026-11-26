@@ -1574,7 +1574,9 @@ mod tests {
     fn bundled_provider_scripts_execute_fail_closed_in_quickjs_without_machine_state() {
         let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let plugins = crate::plugin_engine::manifest::load_plugins_from_dir(&plugin_dir);
-        assert!(plugins.len() >= 30, "expected bundled provider inventory, got {}", plugins.len());
+        // Public builds (which tests are) skip the Google-only plugins.
+        let skipped = if crate::google_terms::PRIVATE_GOOGLE_ACCESS { 0 } else { crate::google_terms::GOOGLE_ONLY_PLUGIN_IDS.len() };
+        assert!(plugins.len() + skipped >= 30, "expected bundled provider inventory, got {}", plugins.len());
         host_api::install_http_mock(vec![(200, "{}"); 400]);
         let dir = temp_app_dir("bundled-provider-smoke");
         let mut failures = Vec::new();

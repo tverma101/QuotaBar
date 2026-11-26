@@ -735,6 +735,7 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     let app_obj = Object::new(ctx.clone())?;
     app_obj.set("version", app_version)?;
     app_obj.set("platform", std::env::consts::OS)?;
+    app_obj.set("googlePrivateAccess", crate::google_terms::PRIVATE_GOOGLE_ACCESS)?;
     app_obj.set("appDataDir", app_data_dir.to_string_lossy().to_string())?;
     let plugin_data_dir = app_data_dir.join("plugins_data").join(instance_id);
     if let Err(err) = std::fs::create_dir_all(&plugin_data_dir) {
@@ -1440,6 +1441,19 @@ fn inject_http<'js>(
                     Exception::throw_message(&ctx_inner, &format!("invalid request: {}", e))
                 })?;
 
+                if crate::google_terms::blocks(crate::google_terms::is_restricted_google_url(&req.url)) {
+                    log::warn!(
+                        "[plugin:{}] refused request to {}: {}",
+                        pid,
+                        redact_url(&req.url),
+                        crate::google_terms::BLOCKED_MESSAGE
+                    );
+                    return Err(Exception::throw_message(
+                        &ctx_inner,
+                        crate::google_terms::BLOCKED_MESSAGE,
+                    ));
+                }
+
                 if deadline.has_elapsed() {
                     return Err(probe_timeout_error(&ctx_inner));
                 }
@@ -2068,6 +2082,11 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                 let opts: LsDiscoverOpts = serde_json::from_str(&opts_json).map_err(|e| {
                     Exception::throw_message(&ctx_inner, &format!("invalid discover opts: {}", e))
                 })?;
+                if crate::google_terms::blocks(crate::google_terms::is_antigravity_plugin(&pid)) {
+                    // Antigravity's local language server is an unsupported third-party interface.
+                    log::info!("[plugin:{}] LS discover skipped in public build", pid);
+                    return Ok("null".to_string());
+                }
 
                 log::info!(
                     "[plugin:{}] LS discover: processName={}, markers={:?}",
@@ -3085,6 +3104,18 @@ fn inject_keychain<'js>(
                             Some(trimmed.to_string())
                         }
                     });
+                if crate::google_terms::blocks(crate::google_terms::is_antigravity_plugin(&pid_read)) {
+                    log::warn!(
+                        "[plugin:{}] refused keychain read of {}: {}",
+                        pid_read,
+                        service,
+                        crate::google_terms::BLOCKED_MESSAGE
+                    );
+                    return Err(Exception::throw_message(
+                        &ctx_inner,
+                        crate::google_terms::BLOCKED_MESSAGE,
+                    ));
+                }
                 let redacted_account = account.as_deref().map(redact_value);
                 if let Some(ref redacted) = redacted_account {
                     log::info!(
@@ -3537,6 +3568,19 @@ fn inject_chromium_cookies<'js>(
                             &format!("invalid chromiumCookies.read args: {}", e),
                         )
                     })?;
+                if crate::google_terms::blocks(
+                    opts.hosts.iter().any(|host| crate::google_terms::is_google_cookie_host(host)),
+                ) {
+                    log::warn!(
+                        "[plugin:{}] refused Google cookie read: {}",
+                        pid,
+                        crate::google_terms::BLOCKED_MESSAGE
+                    );
+                    return Err(Exception::throw_message(
+                        &ctx_inner,
+                        crate::google_terms::BLOCKED_MESSAGE,
+                    ));
+                }
                 log::info!(
                     "[plugin:{}] chromiumCookies.read: {} names, {} hosts",
                     pid,
@@ -3955,6 +3999,48 @@ abc
                     .expect("resolveStateDb must accept a zero-argument call");
                 assert_eq!(result, expected, "{plugin_id}");
             }
+        });
+    }
+
+    #[test]
+    fn public_build_refuses_google_access_below_the_plugins() {
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        let app_data = tempfile::tempdir().expect("app data fixture");
+        let app_data_path = app_data.path().to_path_buf();
+        ctx.with(|ctx| {
+            inject_host_api(&ctx, "antigravity", "antigravity", None, &app_data_path, "0.0.0")
+                .expect("inject host api");
+            patch_http_wrapper(&ctx).expect("patch http");
+            patch_chromium_cookies_wrapper(&ctx).expect("patch chromium cookies");
+            install_http_mock(vec![(200, "{}"); 4]);
+
+            let private: bool = ctx
+                .eval("__openusage_ctx.app.googlePrivateAccess")
+                .expect("googlePrivateAccess");
+            assert!(!private, "tests compile as a public build");
+
+            for script in [
+                r#"__openusage_ctx.host.http.request({ url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota", method: "POST" })"#,
+                r#"__openusage_ctx.host.http.request({ url: "https://oauth2.googleapis.com/token", method: "POST" })"#,
+                r#"__openusage_ctx.host.keychain.readGenericPassword("gemini")"#,
+                r#"__openusage_ctx.host.chromiumCookies.read({ hosts: [".google.com"], names: ["SID"] })"#,
+            ] {
+                let message: String = ctx
+                    .eval(format!(
+                        "(function() {{ try {{ {script}; return 'allowed' }} catch (e) {{ return String(e && e.message || e) }} }})()"
+                    ))
+                    .expect("probe script");
+                assert!(message.contains(crate::google_terms::BLOCKED_MESSAGE), "{script}: {message}");
+            }
+
+            let discovered: Option<String> = ctx
+                .eval(r#"__openusage_ctx.host.ls._discoverRaw(JSON.stringify({ processName: "language_server", markers: ["antigravity"], csrfFlag: "--csrf_token" }))"#)
+                .ok()
+                .filter(|raw: &String| raw != "null");
+            assert!(discovered.is_none(), "public builds must not discover Antigravity's language server");
+
+            assert!(take_http_mock_requests().is_empty(), "blocked requests must never reach the network or a mock");
         });
     }
 

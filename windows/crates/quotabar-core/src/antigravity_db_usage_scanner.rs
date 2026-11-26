@@ -208,21 +208,37 @@ fn conversations_dirs(home_path: Option<&str>) -> Vec<PathBuf> {
         Some(p) => expand_tilde(p),
         None => dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
     };
-    let gemini = home.join(".gemini");
-    let Ok(entries) = fs::read_dir(&gemini) else {
-        return Vec::new();
-    };
-    let mut dirs: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("antigravity")
-                && e.path().is_dir()
-        })
-        .map(|e| e.path().join("conversations"))
-        .collect();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(home.join(".gemini")) {
+        dirs.extend(
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("antigravity")
+                        && e.path().is_dir()
+                })
+                .map(|e| e.path().join("conversations")),
+        );
+    }
+    // The XDG location some Antigravity clients use.
+    let xdg = home.join(".config").join("antigravity").join("conversations");
+    if xdg.is_dir() {
+        dirs.push(xdg);
+    }
+    // T3 Code runs Antigravity through its ACP adapter with a private home per instance, so that
+    // usage never appears under ~/.gemini. Listing these directories reads no credentials.
+    if let Ok(entries) = fs::read_dir(home.join(".t3").join("userdata").join("providers").join("antigravity")) {
+        dirs.extend(
+            entries
+                .flatten()
+                .map(|e| e.path().join("antigravity-acp").join("conversations"))
+                .filter(|path| path.is_dir()),
+        );
+    }
     dirs.sort();
+    dirs.dedup();
     dirs
 }
 
@@ -657,6 +673,34 @@ mod tests {
         assert!(rows[0].total_cost.is_some());
         assert!(rows[0].models.contains_key("gemini-3.6-flash"));
         assert!(!rows[0].models.contains_key("___unset_antigravity_model___"));
+    }
+
+    #[test]
+    fn scan_includes_t3_code_and_xdg_conversation_stores() {
+        let tmp = TempDir::new().unwrap();
+        let t3 = tmp
+            .path()
+            .join(".t3/userdata/providers/antigravity/abc123/antigravity-acp/conversations");
+        let xdg = tmp.path().join(".config/antigravity/conversations");
+        fs::create_dir_all(&t3).unwrap();
+        fs::create_dir_all(&xdg).unwrap();
+        fs::create_dir_all(tmp.path().join(".t3/userdata/providers/antigravity/empty")).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        seed_db(
+            &t3.join("t3.db"),
+            &[(1, Some(encode_generation_blob("gemini-3.6-flash", 10, 90, 40, 5, now)))],
+        );
+        seed_db(
+            &xdg.join("xdg.db"),
+            &[(1, Some(encode_generation_blob("gemini-3.6-flash", 20, 80, 10, 0, now)))],
+        );
+
+        let dirs = conversations_dirs(Some(tmp.path().to_str().unwrap()));
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        let (status, rows) = query_daily_since("", Some(tmp.path().to_str().unwrap()));
+        assert_eq!(status, LogScanStatus::Ok);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_tokens, 255);
     }
 
     #[test]

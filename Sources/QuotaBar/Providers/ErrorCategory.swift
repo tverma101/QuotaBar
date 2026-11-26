@@ -275,6 +275,8 @@ extension AntigravityError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notSignedIn: .notLoggedIn
+        // Like a missing sign-in, it is a setup state rather than a failure.
+        case .noLocalHistory: .notLoggedIn
         case .credentialStoreUnreadable: .credentialAccess
         // Same category as an unreadable store — both are "macOS would not give us the item" — but
         // the remedy differs, which the message now carries.
