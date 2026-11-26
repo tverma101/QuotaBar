@@ -847,10 +847,20 @@ final class AppContainer {
                                 }
                             }
                             accountingTask = nil
-                            let keepWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
+                            // The ceiling branch above handles "too big"; holding the index warm in
+                            // the [soft, ceiling) band is the hysteresis point, so the keep-warm
+                            // decision keys off panel visibility alone.
+                            let keepWarm = transparency.popoverShown
                             await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: keepWarm)
                             await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
-                            if !transparency.popoverShown || ProcessMemoryBudget.isOverSoftLimit {
+                            if !transparency.popoverShown, ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                                ProcessMemoryBudget.noteSoftLimitUnload()
+                                await dataStore.unloadProviderCachesForMemoryPressure()
+                                await ModelPricingStore.shared.clearCaches()
+                            } else if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                                // Hysteresis gate: record the trigger footprint before unloading so
+                                // the ceiling is measured against the pre-unload peak.
+                                ProcessMemoryBudget.noteSoftLimitUnload()
                                 await dataStore.unloadProviderCachesForMemoryPressure()
                                 await ModelPricingStore.shared.clearCaches()
                             }
@@ -865,19 +875,26 @@ final class AppContainer {
                 // refreshes do not decode its parsed-event cache from disk each time. The smaller
                 // Codex session tail remains warm between cycles under its own row cap; memory pressure
                 // releases both, while the durable indexes remain available for the next scan.
-                let keepRouterIndexWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
+                let keepRouterIndexWarm = transparency.popoverShown
                 if accountingTask == nil {
                     await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
                         keepRouterItemsResident: keepRouterIndexWarm
                     )
-                    // Release the provider database caches only over the soft budget. Unloading them
-                    // every closed-panel pass forced each accounting cycle to cold-rebuild Antigravity
+                    // Release the provider database caches only over the unload ceiling. Unloading them
+                    // every pass forced each accounting cycle to cold-rebuild Antigravity
                     // (~25 s), Freebuff (~20 s), and Cursor (~9 s) from their local databases — both a
                     // large recurring CPU sink and, via the rebuilds' parse churn interleaving with
                     // the live heap, the dominant settled-footprint fragmentation. Warm caches are the
-                    // cheaper state; the soft budget and OS pressure still release them when they are
-                    // actually too big.
-                    if !transparency.popoverShown || ProcessMemoryBudget.isOverSoftLimit {
+                    // cheaper state; the hysteresis ceiling and OS pressure still release them when
+                    // they are actually too big.
+                    if !transparency.popoverShown, ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                        ProcessMemoryBudget.noteSoftLimitUnload()
+                        await dataStore.unloadProviderCachesForMemoryPressure()
+                        await ModelPricingStore.shared.clearCaches()
+                    } else if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                        // Hysteresis gate: record the trigger footprint before unloading so the
+                        // ceiling is measured against the pre-unload peak.
+                        ProcessMemoryBudget.noteSoftLimitUnload()
                         await dataStore.unloadProviderCachesForMemoryPressure()
                         await ModelPricingStore.shared.clearCaches()
                     } else {

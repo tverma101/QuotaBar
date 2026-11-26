@@ -128,7 +128,9 @@ actor FreebuffDesktopUsageScanner {
     init(
         // A busy Mac can take more than the default SQLite deadline to drain a large project's
         // complete receipt history. The encompassing provider refresh still bounds the fold.
-        sqlite: any SQLiteAccessing = SQLiteCLIAccessor(queryTimeout: 15),
+        // No read-write fallback: these are another app's live databases — a non-readonly open can
+        // trigger journal/WAL recovery writes into them.
+        sqlite: any SQLiteAccessing = SQLiteCLIAccessor(allowsReadWriteFallback: false, queryTimeout: 15),
         databasePaths: @escaping @Sendable () throws -> [String] = FreebuffDesktopUsageScanner.defaultDatabasePaths,
         sessionEndsPath: @escaping @Sendable () -> String? = FreebuffDesktopUsageScanner.defaultSessionEndsPath,
         parseMetrics: @escaping @Sendable (String) -> [String: Any]? = { ProviderParse.jsonObject(Data($0.utf8)) },
