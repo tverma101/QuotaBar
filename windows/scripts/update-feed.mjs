@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Writes QuotaBar's signed Windows update feed (`latest.json`) for a published GitHub release.
 //
 // The Tauri updater in installed apps reads this feed from the `update-feed` branch, downloads the
