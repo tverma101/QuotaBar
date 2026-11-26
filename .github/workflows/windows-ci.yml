@@ -59,24 +59,38 @@ jobs:
 
       - name: Build x64 Installer
         shell: pwsh
+        env:
+          # Only tagged release builds sign the installer for the in-app updater (docs/releasing.md).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         run: |
           $buildArgs = @('--bundles', 'nsis')
           if ($env:GITHUB_REF_TYPE -eq 'tag') {
             if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+(?:-beta\.\d+)?$') {
               throw "The Windows installer requires a valid QuotaBar release tag."
             }
+            if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+              throw "Release builds must sign the update. Add the TAURI_SIGNING_PRIVATE_KEY repository secret."
+            }
             $config = Join-Path $env:RUNNER_TEMP 'quotabar-release.json'
-            @{ version = $env:GITHUB_REF_NAME.Substring(1) } |
-              ConvertTo-Json -Compress | Set-Content -Encoding Ascii $config
+            @{ version = $env:GITHUB_REF_NAME.Substring(1); bundle = @{ createUpdaterArtifacts = $true } } |
+              ConvertTo-Json -Compress -Depth 4 | Set-Content -Encoding Ascii $config
             $buildArgs += @('--config', $config)
           }
           bun run tauri:build @buildArgs -- --locked
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $signatures = @(Get-ChildItem target -Recurse -File -Filter '*-setup.exe.sig' |
+              Where-Object { $_.DirectoryName -match '[\\/]bundle[\\/]nsis$' })
+            if ($signatures.Count -ne 1) {
+              throw "Expected one updater signature for the installer, found $($signatures.Count)."
+            }
+          }
 
       - name: Smoke-test Installation and Bundled CLI
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem target -Recurse -File -Filter '*-setup.exe' |
-            Where-Object { $_.DirectoryName -match '[\\/]bundle[\\/]nsis$' })
+            Where-Object { $_.Extension -eq '.exe' -and $_.DirectoryName -match '[\\/]bundle[\\/]nsis$' })
           if ($installers.Count -ne 1) {
             throw "Expected one x64 NSIS installer, found $($installers.Count)."
           }
@@ -86,7 +100,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: quotabar-windows-x64-qa
-          path: windows/target/**/bundle/nsis/*-setup.exe
+          path: |
+            windows/target/**/bundle/nsis/*-setup.exe
+            windows/target/**/bundle/nsis/*-setup.exe.sig
           if-no-files-found: error
           compression-level: 0
           retention-days: 7

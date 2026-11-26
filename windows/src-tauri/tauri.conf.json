@@ -88,5 +88,16 @@
         "installMode": "currentUser"
       }
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdEOTk4QUQwRkMxMjAyRTQKUldUa0FoTDgwSXFaZlU5dkdmcVpUQ2ZXUlYxeDJlcTNhWlpDbjRoWVlJNzNMV1JsdHA5RXc4WkIK",
+      "endpoints": [
+        "https://raw.githubusercontent.com/tverma101/QuotaBar/update-feed/windows/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

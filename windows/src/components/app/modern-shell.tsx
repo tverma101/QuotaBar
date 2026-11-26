@@ -13,6 +13,8 @@ import { AppContent, type AppContentActionProps } from "@/components/app/app-con
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import { useAppVersion } from "@/hooks/app/use-app-version"
+import { useTrayRestartBridge } from "@/hooks/app/use-tray-restart-bridge"
+import type { UpdateStatus } from "@/hooks/use-app-update"
 import { useModernDashboard } from "@/hooks/app/use-modern-dashboard"
 import { useModernPanel } from "@/hooks/app/use-modern-panel"
 import { useNowTicker } from "@/hooks/use-now-ticker"
@@ -38,6 +40,9 @@ type ModernShellProps = {
   displayPlugins: DisplayPluginState[]
   settingsPlugins: SettingsPluginState[]
   autoUpdateNextAt: number | null
+  updateStatus: UpdateStatus
+  onUpdateInstall: () => void
+  onUpdateCheck: () => void
   appContentProps: AppContentActionProps
   showOnboardingWizard: boolean
   onOnboardingComplete: (layout: UILayout, openSettings?: boolean) => void
@@ -48,6 +53,9 @@ export function ModernShell({
   displayPlugins,
   settingsPlugins,
   autoUpdateNextAt,
+  updateStatus,
+  onUpdateInstall,
+  onUpdateCheck,
   appContentProps,
   showOnboardingWizard,
   onOnboardingComplete,
@@ -57,6 +65,7 @@ export function ModernShell({
   )
   const screen = stack[stack.length - 1] ?? DASHBOARD
   const appVersion = useAppVersion()
+  useTrayRestartBridge(updateStatus, onUpdateInstall)
   const panelRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
 
@@ -260,6 +269,9 @@ export function ModernShell({
         <ModernFooter
           version={appVersion}
           autoUpdateNextAt={autoUpdateNextAt}
+          updateStatus={updateStatus}
+          onUpdateInstall={onUpdateInstall}
+          onUpdateCheck={onUpdateCheck}
           refreshing={refreshing}
           onRefreshAll={onRefreshAll}
           showAbout={showAbout}

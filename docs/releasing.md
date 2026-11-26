@@ -37,9 +37,30 @@ Before publishing, install from that image on a clean Mac user profile with Gate
 
 ## Windows
 
-Create the owner-approved version tag from the tested commit on `main`. Run **Windows CI** on that tag. The workflow uses the tag as the installer version and tests the per-user install, bundled CLI, cached limits, and uninstall before uploading `quotabar-windows-x64-qa`.
+Create the owner-approved version tag from the tested commit on `main`. Run **Windows CI** on that tag. The workflow uses the tag as the installer version and tests the per-user install, bundled CLI, cached limits, and uninstall before uploading `quotabar-windows-x64-qa`. Tagged builds also sign the installer for the in-app updater with the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets, and fail if those secrets are missing.
 
-Download the artifact from that run and verify its archive SHA-256 against the digest reported by GitHub Actions. Extract the matching `QuotaBar_<version>_x64-setup.exe`. The build uses MSVC for the public installer.
+Download the artifact from that run and verify its archive SHA-256 against the digest reported by GitHub Actions. Extract the matching `QuotaBar_<version>_x64-setup.exe` and its `QuotaBar_<version>_x64-setup.exe.sig`. The build uses MSVC for the public installer.
+
+### Automatic updates
+
+Installed Windows apps check QuotaBar's own update feed at launch and every 15 minutes. The feed is
+`windows/latest.json` on this repository's `update-feed` branch. When it offers a newer version, the app
+downloads the installer from the GitHub release and checks its signature against the public key built
+into the app. If the signature does not match, nothing is installed. The footer shows the download, then
+**Ready to update**, which installs the update and restarts QuotaBar.
+
+You never edit the feed by hand. Publishing a GitHub release runs **Update Feed**, which:
+
+- reads the release's installer `.sig`;
+- writes the feed; and
+- refuses to move the feed to an older version.
+
+Drafts never reach users. To re-offer a release, run **Update Feed** manually with its tag.
+
+The private signing key exists only in the repository secrets and on the owner's machine. The owner keeps
+an offline backup of it. Losing the key means installed apps can never auto-update again. Replacing the
+key requires one manual reinstall, so never rotate it casually. Installs older than the first updater
+release need one manual update to a release that includes the updater.
 
 To reproduce the tagged build locally, check out the same tag on Windows x64 and run these commands from PowerShell in `windows/`.
 
@@ -61,6 +82,6 @@ To repeat the CI smoke test in a disposable user profile, run `./scripts/smoke-i
 
 ## GitHub
 
-Create a draft GitHub release for the approved tag. Attach each tested installer and a `SHA256SUMS.txt` with the hash of each attached binary. Mark beta releases as prereleases. State the platforms included, link to source build instructions for other platforms, and link to the tagged CI run.
+Create a draft GitHub release for the approved tag. Attach each tested installer, the Windows installer's `.sig` (the update feed needs it), and a `SHA256SUMS.txt` with the hash of each attached binary. Mark beta releases as prereleases. State the platforms included, link to source build instructions for other platforms, and link to the tagged CI run.
 
 After publishing, download each asset without GitHub credentials and verify the installer hashes against the published checksum file. Link the current installer and release notes in the READMEs, and move the shipped changes from **Unreleased** into their version section in the changelog. [GitHub Releases](https://github.com/tverma101/QuotaBar/releases)

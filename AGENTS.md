@@ -21,9 +21,14 @@ hand with `./script/build_and_run.sh build`.
 ### Guardrails (do not break)
 - **Never increase the version number on your own initiative — ask for explicit approval first.**
   Versions continue upstream's `0.7.x` line so the two codebases stay comparable.
-- The app has **no auto-update path**. This public fork does not have its own signed appcast or
-  automated release feed. Do not point QuotaBar at upstream’s update feed; a future updater needs a
-  QuotaBar-owned release and signing process.
+- **Updates come only from QuotaBar's own GitHub releases.** Never point either app at upstream's
+  update feed.
+  - Windows uses the Tauri updater. It reads `windows/latest.json` on the `update-feed` branch, which
+    the **Update Feed** workflow writes when a release is published.
+  - The updater verifies installers against the public key in `windows/src-tauri/tauri.conf.json`. Do
+    not change that key: installed apps would stop updating.
+  - The macOS app has no auto-update path. No signed DMG is published yet. A future Sparkle updater
+    needs a QuotaBar-owned EdDSA key and appcast. See `docs/releasing.md`.
 - iCloud Sync is inert: its container must be registered in the owner's Apple Developer team first.
   Do not treat the Settings section as a working feature.
 - **Public builds follow Google's Antigravity and Gemini terms.** They read only local Antigravity

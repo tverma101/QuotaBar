@@ -22,8 +22,9 @@ website, and CrossUsage branding assets.
    homepage, and all user-facing strings.
 2. **Icons** — `src-tauri/icons/` regenerated from `assets/AppIcon.icon/Assets/quotabar-gauge.svg`
    via `scripts/render-icon.html` / `render-tray-icon.html` (headless-Chrome raster pipeline).
-3. **Release services** — QuotaBar ships without the imported analytics tracker, product polls, and
-   signing key. About links to GitHub Releases for downloads and manual updates.
+3. **Release services** — QuotaBar ships without the imported analytics tracker and product polls. The
+   imported updater signing key was replaced with a QuotaBar-owned key, and the updater reads this
+   repository's `update-feed` branch. About still links to GitHub Releases for downloads.
 4. **Windows setup** — a per-user installer bundles the CLI and providers. Settings use the user's
    roaming app-data directory. The compact panel groups settings into sections.
 

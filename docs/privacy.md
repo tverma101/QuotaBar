@@ -84,6 +84,11 @@ local setup source was found, not that a later provider refresh is guaranteed to
 
 Besides provider API calls, QuotaBar fetches public [model price lists](pricing.md) about once an hour from `openrouter.ai`, `raw.githubusercontent.com`, `models.dev`, and the OpenUsage pricing supplement at `robinebers.github.io`. An unknown model can bring forward an OpenRouter catalogue refresh, with retry limits. These downloads carry no model names, usage, log, or account information and run regardless of the analytics toggle. The pricing request does not include an OpenRouter API key. QuotaBar computes spend tiles from local CLI logs on your Mac and keeps the raw logs on the device.
 
+On Windows, the app checks for updates at launch and every 15 minutes. It reads `latest.json` from
+`raw.githubusercontent.com` (this repository's `update-feed` branch) and, when a newer version exists,
+downloads the installer from GitHub Releases. These requests carry only the standard client headers,
+never usage or account data. The macOS app does not check for updates.
+
 To avoid re-reading unchanged Claude, Codex, and pi logs after every relaunch, QuotaBar keeps their
 parsed usage events in `~/Library/Application Support/QuotaBar/log-scan-cache/`. These records contain
 the usage metadata needed for local totals, including any per-event cost already recorded by a provider,
