@@ -42,10 +42,13 @@ export function useModernDashboard(displayPlugins: DisplayPluginState[], nowMs: 
     })),
   )
 
+  const descriptors = useMemo(() => {
+    const pluginStates = Object.fromEntries(displayPlugins.map((p) => [p.meta.id, { data: p.data }]))
+    return buildMetricDescriptors(pluginsMeta, pluginSettings, pluginStates)
+  }, [pluginsMeta, pluginSettings, displayPlugins])
+
   useEffect(() => {
     if (!pluginSettings || !layout.hydrated) return
-    const pluginStates = Object.fromEntries(displayPlugins.map((p) => [p.meta.id, { data: p.data }]))
-    const descriptors = buildMetricDescriptors(pluginsMeta, pluginSettings, pluginStates)
     const state = useModernLayoutStore.getState()
 
     let settings = pluginSettings
@@ -64,12 +67,7 @@ export function useModernDashboard(displayPlugins: DisplayPluginState[], nowMs: 
     }
     state.syncDescriptors(descriptors)
     state.syncPinsFromTrayLines(settings.trayLines, descriptors)
-  }, [pluginSettings, pluginsMeta, layout.hydrated, displayPlugins])
-
-  const descriptors = useMemo(() => {
-    const pluginStates = Object.fromEntries(displayPlugins.map((p) => [p.meta.id, { data: p.data }]))
-    return buildMetricDescriptors(pluginsMeta, pluginSettings, pluginStates)
-  }, [pluginsMeta, pluginSettings, displayPlugins])
+  }, [pluginSettings, layout.hydrated, descriptors])
 
   const placedMetricIds = useMemo(
     () => (pluginSettings ? placedIdsFromPluginSettings(pluginSettings, descriptors) : []),

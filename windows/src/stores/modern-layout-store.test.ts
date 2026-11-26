@@ -5,6 +5,7 @@ vi.mock("@/lib/settings", () => ({
   saveModernLayout: vi.fn().mockResolvedValue(undefined),
 }))
 
+import { saveModernLayout } from "@/lib/settings"
 import { metricId } from "@/lib/metric-id"
 import { EMPTY_MODERN_LAYOUT } from "@/lib/modern-layout"
 import type { MetricDescriptor } from "@/lib/metric-registry"
@@ -89,5 +90,40 @@ describe("modern-layout-store tray readout", () => {
       cursorCredits,
     ])
     expect(state.pinnedMetricIds).not.toContain(claudeWeekly)
+  })
+})
+
+describe("modern-layout-store descriptor sync", () => {
+  beforeEach(() => {
+    useModernLayoutStore.setState({
+      ...EMPTY_MODERN_LAYOUT,
+      hydrated: true,
+      pinLimitNotice: null,
+      initialized: true,
+      pinnedMetricIds: [claudeSession],
+      trayFocusProviderId: "claude",
+    })
+    vi.mocked(saveModernLayout).mockClear()
+  })
+
+  it("writes once when descriptors add metrics, then not again for the same descriptors", () => {
+    const store = useModernLayoutStore.getState()
+    store.syncDescriptors(descriptors)
+    expect(saveModernLayout).toHaveBeenCalledTimes(1)
+    const after = useModernLayoutStore.getState()
+    expect(after.metricOrderByProvider.claude).toEqual([claudeSession, claudeWeekly])
+
+    useModernLayoutStore.getState().syncDescriptors(descriptors)
+    useModernLayoutStore.getState().syncDescriptors([...descriptors])
+    expect(saveModernLayout).toHaveBeenCalledTimes(1)
+    expect(useModernLayoutStore.getState().metricOrderByProvider).toBe(after.metricOrderByProvider)
+  })
+
+  it("still writes when a pinned metric disappears", () => {
+    useModernLayoutStore.getState().syncDescriptors(descriptors)
+    vi.mocked(saveModernLayout).mockClear()
+    useModernLayoutStore.getState().syncDescriptors(descriptors.filter((d) => d.id !== claudeSession))
+    expect(saveModernLayout).toHaveBeenCalledTimes(1)
+    expect(useModernLayoutStore.getState().pinnedMetricIds).toEqual([])
   })
 })
