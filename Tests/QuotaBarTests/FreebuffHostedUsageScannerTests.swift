@@ -4,6 +4,16 @@ import XCTest
 
 final class FreebuffHostedUsageScannerTests: XCTestCase {
     private let now = TestLocalInstant.date(2026, 10, 31, 18)
+
+    /// Hosted history/catalog is an opt-in gate (default off); provider-level tests that exercise
+    /// the hosted path inject an isolated suite with the flag set.
+    @MainActor
+    private func hostedDefaults(_ enabled: Bool = true) -> UserDefaults {
+        let suite = "QuotaBarTests.HostedDetail.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set(enabled, forKey: FreebuffProvider.hostedDetailDefaultsKey)
+        return defaults
+    }
     private let auth = FreebuffAuth(token: "fixture-token")
     private let prefix = "/api/v1/cloud/history/"
 
@@ -308,6 +318,7 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
                 files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
             usageClient: FreebuffUsageClient(http: http), now: { date }, modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults(),
             pricing: { .empty }
         )
         _ = await ProviderRefreshContext.$scope.withValue(.menuBar) { await provider.refresh() }
@@ -344,7 +355,8 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             authStore: FreebuffAuthStore(
                 files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
-            usageClient: FreebuffUsageClient(http: http), now: { date }, modelCatalog: FreebuffModelCatalog(cacheURL: nil)
+            usageClient: FreebuffUsageClient(http: http), now: { date }, modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults()
         )
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.historyWarning, "Some Freebuff runs have no complete token receipt. Totals include only measured usage.")
@@ -364,6 +376,26 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
     }
 
     @MainActor
+    func testHostedDetailGateOffIssuesOnlyTheSessionCall() async throws {
+        let http = HostedHTTP([
+            "/api/v1/freebuff/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())]
+        ])
+        let provider = FreebuffProvider(
+            historyScanner: FreebuffDesktopUsageScanner(databasePaths: { [] }),
+            hostedScanner: FreebuffHostedUsageScanner(cacheURL: nil),
+            authStore: FreebuffAuthStore(
+                files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
+                keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
+            usageClient: FreebuffUsageClient(http: http), modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults(false)
+        )
+        _ = await provider.refresh()
+        let requests = await http.requests
+        XCTAssertEqual(requests.map(\.url.path), ["/api/v1/freebuff/session"],
+                       "gated off, no hosted history or catalogue calls may leave the process")
+    }
+
+    @MainActor
     func testFailedHostedHistoryWarningSurvivesSuccessfulQuotaRefresh() async throws {
         let http = HostedHTTP([
             "/api/v1/freebuff/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())],
@@ -375,7 +407,8 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             authStore: FreebuffAuthStore(
                 files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
-            usageClient: FreebuffUsageClient(http: http), modelCatalog: FreebuffModelCatalog(cacheURL: nil)
+            usageClient: FreebuffUsageClient(http: http), modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults()
         )
         let failed = await provider.refresh()
         XCTAssertNotNil(failed.historyWarning)

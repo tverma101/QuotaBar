@@ -335,7 +335,7 @@ enum ProviderCatalog {
             AntigravityProvider(),
             CopilotProvider(defaults: defaults),
             DevinProvider(),
-            FreebuffProvider(authStore: FreebuffAuthStore(environment: openUsageEnvironment)),
+            FreebuffProvider(authStore: FreebuffAuthStore(environment: openUsageEnvironment), defaults: defaults),
             GrokProvider(),
             HermesProvider(),
             openCode,
