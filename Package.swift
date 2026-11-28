@@ -24,7 +24,7 @@ let package = Package(
         // The de-facto standard recorder + global hotkey for Mac apps (System Settings-style field).
         .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", from: "3.0.1"),
         // Anonymous usage analytics and mandatory crash reporting (official first-party Swift SDK).
-        .package(url: "https://github.com/PostHog/posthog-ios.git", from: "3.62.0")
+        .package(url: "https://github.com/PostHog/posthog-ios.git", from: "4.0.11")
     ],
     targets: [
         .target(
